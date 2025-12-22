@@ -1,0 +1,34 @@
+# Python ignore file for message_queue module
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.so
+*.dll
+*.dylib
+*.log
+*.sqlite
+*.db
+*.sqlite3
+
+# Ignore temporary files
+*.tmp
+*.temp
+*.swp
+
+# Ignore virtual environment directories
+venv/
+env/
+.venv/
+.env/
+
+# Ignore IDE specific files
+.vscode/
+.idea/
+*.iml
+
+# Ignore build and distribution directories
+build/
+dist/
+*.egg-info/
+.eggs/

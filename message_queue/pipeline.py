@@ -1,0 +1,634 @@
+"""
+High-Level Pipeline Framework for Multi-Process Data Processing.
+
+This module provides a decorator-based API for building complex data pipelines.
+It handles process management, inter-node communication, shared memory 
+optimization, and real-time monitoring.
+
+Key Components:
+- @node: Decorator to transform a function into a pipeline stage.
+- Pipeline: Orchestrator that manages workers, queues, and metrics.
+- PipelineNode: Base class for custom node implementations.
+"""
+from __future__ import annotations
+import multiprocessing
+import logging
+import time
+import os
+import signal
+import threading
+from abc import ABC, abstractmethod
+from typing import Any, Optional, List, Dict, Union, Iterable, Callable
+
+from .message_queue import (
+    PartitionedPriorityQueue, Message, SharedMemoryPool, 
+    run_worker_loop, set_default_pool, get_default_pool,
+    pack_payload, free_payload, load_array_from_payload
+)
+from .monitor import start_monitor_server
+
+logger = logging.getLogger(__name__)
+
+class PipelineNode(ABC):
+    """
+    Abstract base class for a pipeline stage.
+    
+    A node defines how data is processed and how many workers should be 
+    allocated to it. It also provides lifecycle hooks (setup/teardown).
+    
+    Attributes:
+        name: Unique identifier for the node.
+        num_workers: Number of parallel processes for this stage.
+        input_partition: The queue partition to read from.
+        output_partition: The queue partition to write results to.
+        result_msg_type: The type tag for output messages.
+        priority: Default priority for output messages.
+        processing_delay: Artificial delay for simulation/testing.
+    """
+    
+    def __init__(self, name: str, num_workers: int = 1, input_partition: Optional[str] = None, 
+                 output_partition: Optional[str] = None, result_msg_type: str = 'task',
+                 priority: int = 50, processing_delay: float = 0.0):
+        self.name = name
+        self.num_workers = num_workers
+        self.input_partition = input_partition
+        self.output_partition = output_partition
+        self.result_msg_type = result_msg_type
+        self.priority = priority
+        self.processing_delay = processing_delay
+        self.logger = logging.getLogger(f"{__name__}.{name}")
+
+    def log(self, level: int, msg: str, *args, **kwargs):
+        """Log a message with node context."""
+        extra = kwargs.get('extra', {})
+        extra.update({'node': self.name, 'pid': os.getpid()})
+        kwargs['extra'] = extra
+        self.logger.log(level, f"[{self.name}] {msg}", *args, **kwargs)
+
+    def info(self, msg: str, *args, **kwargs): self.log(logging.INFO, msg, *args, **kwargs)
+    def error(self, msg: str, *args, **kwargs): self.log(logging.ERROR, msg, *args, **kwargs)
+    def warning(self, msg: str, *args, **kwargs): self.log(logging.WARNING, msg, *args, **kwargs)
+    def debug(self, msg: str, *args, **kwargs): self.log(logging.DEBUG, msg, *args, **kwargs)
+
+    def setup(self):
+        """Initialize resources (e.g., load models). Called once per worker process."""
+        pass
+
+    @abstractmethod
+    def process(self, data: Any, payload: dict, msg: Message) -> Optional[Any]:
+        """Process a single message.
+        
+        Args:
+            data: The unwrapped data (e.g., numpy array from SHM if present).
+            payload: The full message payload dictionary.
+            msg: The original Message object.
+            
+        Returns:
+            The result to be sent to the next stage, or None to drop.
+        """
+        pass
+
+    def teardown(self):
+        """Cleanup resources. Called once per worker process on shutdown."""
+        pass
+
+class SimpleNode(PipelineNode):
+    """A simple pipeline node that wraps a function."""
+    def __init__(self, fn: callable, name: Optional[str] = None, 
+                 setup_fn: Optional[callable] = None, 
+                 teardown_fn: Optional[callable] = None, **kwargs):
+        name = name or fn.__name__
+        super().__init__(name=name, **kwargs)
+        self.fn = fn
+        self.setup_fn = setup_fn
+        self.teardown_fn = teardown_fn
+        self.context = None
+        import inspect
+        self._params_count = len(inspect.signature(fn).parameters)
+
+    def setup(self, fn: Optional[callable] = None):
+        """Can be used as a decorator or called by worker."""
+        if fn is not None:
+            self.setup_fn = fn
+            return fn
+        if self.setup_fn:
+            self.context = self.setup_fn()
+
+    def teardown(self, fn: Optional[callable] = None):
+        """Can be used as a decorator or called by worker."""
+        if fn is not None:
+            self.teardown_fn = fn
+            return fn
+        if self.teardown_fn:
+            if self.context is not None:
+                self.teardown_fn(self.context)
+            else:
+                self.teardown_fn()
+
+    def process(self, data: Any, payload: dict, msg: Message) -> Optional[Any]:
+        args = [data]
+        if self.context is not None:
+            if self._params_count >= 2: args.append(self.context)
+            if self._params_count >= 3: args.append(payload)
+            if self._params_count >= 4: args.append(msg)
+        else:
+            if self._params_count >= 2: args.append(payload)
+            if self._params_count >= 3: args.append(msg)
+        
+        return self.fn(*args[:self._params_count])
+
+def node(name: Optional[str] = None, workers: int = 1, input: Optional[str] = None, 
+         output: Optional[str] = None, delay: float = 0.0,
+         setup: Optional[callable] = None, teardown: Optional[callable] = None):
+    """
+    Decorator to create a pipeline node from a function.
+    
+    The decorated function can have various signatures:
+    - fn(data)
+    - fn(data, context)
+    - fn(data, context, payload)
+    - fn(data, context, payload, message)
+    
+    Usage:
+        @node(name="preprocess", workers=2, output="inference")
+        def preprocess(image):
+            return image / 255.0
+
+        @preprocess.setup
+        def init():
+            return "some_context"
+            
+    Args:
+        name: Node name (defaults to function name).
+        workers: Number of parallel processes.
+        input: Input partition name.
+        output: Output partition name.
+        delay: Artificial delay (seconds).
+        setup: Optional setup function.
+        teardown: Optional teardown function.
+    """
+    def decorator(fn):
+        node_obj = SimpleNode(
+            fn=fn, 
+            name=name or fn.__name__, 
+            num_workers=workers, 
+            input_partition=input, 
+            output_partition=output,
+            processing_delay=delay,
+            setup_fn=setup,
+            teardown_fn=teardown
+        )
+        # Attach the node object to the function so Pipeline.add can find it
+        fn._pipeline_node = node_obj
+        
+        # Add setup/teardown helper decorators to the function as well
+        def setup_decorator(setup_fn):
+            node_obj.setup_fn = setup_fn
+            return setup_fn
+        fn.setup = setup_decorator
+        
+        def teardown_decorator(teardown_fn):
+            node_obj.teardown_fn = teardown_fn
+            return teardown_fn
+        fn.teardown = teardown_decorator
+        
+        return fn
+    return decorator
+
+class Pipeline:
+    """
+    Orchestrator for a multi-stage processing pipeline.
+    
+    The Pipeline class manages the lifecycle of all nodes, handles the 
+    Shared Memory Pool, and provides monitoring capabilities.
+    
+    Key Features:
+    - Automatic Worker Management: Restarts dead workers automatically.
+    - SHM Leak Prevention: Reclaims shared memory from crashed workers.
+    - Real-time Dashboard: Built-in web server for performance metrics.
+    - Fast Shutdown: Parallel process termination for near-instant stop.
+    """
+    
+    def __init__(self, manager: Optional[Any] = None, 
+                 pool_size: int = 16, block_size: int = 1024*1024*3):
+        self._manager = manager or multiprocessing.Manager()
+        self._nodes: List[PipelineNode] = []
+        self._pool_size = pool_size
+        self._block_size = block_size
+        self._queue: Optional[PartitionedPriorityQueue] = None
+        self._pool: Optional[SharedMemoryPool] = None
+        self._processes: Dict[int, tuple] = {} # pid -> (node, process_obj)
+        self._active_tasks = self._manager.dict() # pid -> Message
+        self._stop_event = multiprocessing.Event()
+        
+        # Metrics for monitoring
+        self.metrics = self._manager.dict()
+        self.metrics["nodes"] = {}
+        self.metrics["pipeline"] = {
+            "input_count": 0,
+            "output_count": 0,
+            "input_rate": 0.0,
+            "output_rate": 0.0
+        }
+        self.metrics["pool"] = {"used": 0, "total": 0}
+        self.metrics["partitions"] = {}
+        
+        self._last_metrics_snapshot = {}
+        self._monitor_thread = None
+        self._rate_thread = None
+
+    @classmethod
+    def from_nodes(cls, nodes: List[Union[PipelineNode, callable]], **kwargs) -> Pipeline:
+        """Create a pipeline from a list of nodes/functions."""
+        p = cls(**kwargs)
+        for n in nodes:
+            p.add(n)
+        return p
+
+    def start_monitor(self, port=8000):
+        """Start the web monitor server and rate calculation thread."""
+        if self._monitor_thread is not None:
+            return
+            
+        self._monitor_thread = threading.Thread(
+            target=start_monitor_server, 
+            args=(self.metrics, port),
+            daemon=True
+        )
+        self._monitor_thread.start()
+        
+        self._rate_thread = threading.Thread(target=self._rate_calculator_loop, daemon=True)
+        self._rate_thread.start()
+        logger.info(f"Monitor started at http://localhost:{port}")
+
+    def _rate_calculator_loop(self):
+        """Periodically calculate rates (TPS) for all nodes."""
+        last_time = time.time()
+        
+        while not self._stop_event.is_set():
+            time.sleep(1.0)
+            now = time.time()
+            dt = now - last_time
+            if dt <= 0: continue
+            
+            # Update pipeline rates
+            p_metrics = self.metrics["pipeline"]
+            in_count = p_metrics["input_count"]
+            out_count = p_metrics["output_count"]
+            
+            last_in = self._last_metrics_snapshot.get("in", 0)
+            last_out = self._last_metrics_snapshot.get("out", 0)
+            
+            p_metrics["input_rate"] = round((in_count - last_in) / dt, 2)
+            p_metrics["output_rate"] = round((out_count - last_out) / dt, 2)
+            
+            self._last_metrics_snapshot["in"] = in_count
+            self._last_metrics_snapshot["out"] = out_count
+            self.metrics["pipeline"] = p_metrics # Trigger sync
+            
+            # Update node rates
+            n_metrics = self.metrics["nodes"]
+            for node_name, stats in n_metrics.items():
+                curr_total = stats["success"] + stats["fail"]
+                last_total = self._last_metrics_snapshot.get(f"node_{node_name}", 0)
+                
+                stats["rate"] = round((curr_total - last_total) / dt, 2)
+                n_metrics[node_name] = stats # Trigger sync
+                self._last_metrics_snapshot[f"node_{node_name}"] = curr_total
+            
+            self.metrics["nodes"] = n_metrics
+
+            # Update Pool status
+            if self._pool:
+                pool_status = self._pool.get_status()
+                self.metrics["pool"] = {
+                    "used": pool_status["used"],
+                    "total": pool_status["total"]
+                }
+
+            # Update Partition status
+            if self._queue:
+                q_status = self._queue.get_status()
+                self.metrics["partitions"] = q_status
+
+            last_time = now
+
+    def add_node(self, node: Union[PipelineNode, callable]) -> Pipeline:
+        if not isinstance(node, PipelineNode) and callable(node):
+            if hasattr(node, "_pipeline_node"):
+                node = getattr(node, "_pipeline_node")
+            else:
+                node = SimpleNode(node)
+            
+        self._nodes.append(node)
+        
+        # Initialize node metrics
+        n_metrics = self.metrics["nodes"]
+        n_metrics[node.name] = {
+            "success": 0,
+            "fail": 0,
+            "rate": 0.0,
+            "latency": 0.0,
+            "input": node.input_partition,
+            "output": node.output_partition
+        }
+        self.metrics["nodes"] = n_metrics
+        
+        logger.info(f"Added node '{node.name}' to pipeline (workers: {node.num_workers}, input: {node.input_partition})")
+        return self
+
+    def add(self, node: Union[PipelineNode, callable]) -> Pipeline:
+        """Alias for add_node."""
+        return self.add_node(node)
+
+    def run(self, monitor_port: Optional[int] = 8000, check_interval: float = 1.0):
+        """
+        High-level entry point: starts monitor, starts workers, and enters 
+        the monitoring loop until interrupted.
+        """
+        self._stop_requested = 0
+        
+        def handle_exit(signum, frame):
+            self._stop_requested += 1
+            if self._stop_requested > 1:
+                # Second Ctrl+C: Force exit immediately
+                # Try to cleanup SHM before hard exit
+                try:
+                    from .message_queue import _cleanup_shm
+                    _cleanup_shm()
+                except Exception:
+                    pass
+                os._exit(1)
+            self._stop_event.set()
+        
+        signal.signal(signal.SIGINT, handle_exit)
+        signal.signal(signal.SIGTERM, handle_exit)
+
+        try:
+            if monitor_port:
+                self.start_monitor(port=monitor_port)
+            
+            self.start()
+            
+            logger.info("Pipeline is running. Press Ctrl+C to stop (twice to force exit).")
+            while not self._stop_event.is_set():
+                self.monitor_and_restart()
+                time.sleep(check_interval)
+        except KeyboardInterrupt:
+            pass
+        finally:
+            self.stop()
+
+    @staticmethod
+    def _worker_entry(node: PipelineNode, queue: PartitionedPriorityQueue, pool: SharedMemoryPool, 
+                      active_tasks: dict, metrics: dict, stop_event: Any):
+        """Entry point for worker processes."""
+        set_default_pool(pool)
+        pid = os.getpid()
+        # print(f"DEBUG: Worker {node.name} (pid {pid}) starting loop...", flush=True)
+        
+        # Setup signal handlers for workers to ensure cleanup on SIGTERM
+        def handle_sigterm(*args):
+            node.teardown()
+            os._exit(0)
+        signal.signal(signal.SIGTERM, handle_sigterm)
+
+        def on_start(msg):
+            active_tasks[pid] = msg
+            msg.payload['_start_time'] = time.time()
+            
+        def on_done(msg):
+            if pid in active_tasks:
+                del active_tasks[pid]
+            
+            duration = time.time() - msg.payload.get('_start_time', time.time())
+            
+            # Update metrics
+            try:
+                n_metrics = metrics.get("nodes")
+                if n_metrics is not None:
+                    stats = n_metrics.get(node.name)
+                    if stats is not None:
+                        # stats is a regular dict (copy from Manager.dict)
+                        if msg.payload.get('error'):
+                            stats["fail"] += 1
+                        else:
+                            stats["success"] += 1
+                        
+                        # Moving average for latency
+                        curr_lat = stats.get("latency", 0.0)
+                        stats["latency"] = round(curr_lat * 0.9 + duration * 0.1, 4)
+                        
+                        n_metrics[node.name] = stats # Update the Manager.dict
+                        metrics["nodes"] = n_metrics # Ensure top-level sync
+
+                        # If this node is a sink (no output partition), count as pipeline output
+                        if not node.output_partition:
+                            p_metrics = metrics["pipeline"]
+                            p_metrics["output_count"] += 1
+                            metrics["pipeline"] = p_metrics
+            except Exception as e:
+                logger.error(f"Metrics update error in worker: {e}")
+
+        try:
+            node.setup()
+            run_worker_loop(
+                queue=queue,
+                business_fn=node.process,
+                desired_types=(node.name + "_task", "task"),
+                group=node.name,
+                pool=pool,
+                worker_name=f"{node.name}-{pid}",
+                processing_delay=node.processing_delay,
+                partition=node.input_partition,
+                result_partition=node.output_partition,
+                result_msg_type=node.result_msg_type,
+                on_task_start=on_start,
+                on_task_done=on_done,
+                stop_event=stop_event
+            )
+        except Exception as e:
+            node.error(f"Crashed with exception: {e}", exc_info=True)
+            raise
+        finally:
+            node.teardown()
+
+    def build(self, capacities: Optional[Dict[str, int]] = None):
+        """Initialize queue and pool based on added nodes."""
+        # Determine partitions and capacities
+        parts = capacities or {}
+        for node in self._nodes:
+            if node.input_partition and node.input_partition not in parts:
+                parts[node.input_partition] = max(node.num_workers * 2, 16)
+            if node.output_partition and node.output_partition not in parts:
+                parts[node.output_partition] = 1024 # Default large capacity for results/meta
+
+        self._queue = PartitionedPriorityQueue(manager=self._manager, partitions=parts)
+        self._pool = SharedMemoryPool.create(self._manager, pool_size=self._pool_size, block_size=self._block_size)
+        set_default_pool(self._pool)
+        return self
+
+    def _start_worker(self, node: PipelineNode):
+        p = multiprocessing.Process(
+            target=self._worker_entry, 
+            args=(node, self._queue, self._pool, self._active_tasks, self.metrics, self._stop_event),
+            daemon=True
+        )
+        p.start()
+        self._processes[p.pid] = (node, p)
+        return p
+
+    def start(self):
+        """Launch all worker processes."""
+        if not self._queue:
+            self.build()
+            
+        for node in self._nodes:
+            for _ in range(node.num_workers):
+                self._start_worker(node)
+        logger.info(f"Pipeline started with {len(self._nodes)} nodes and {len(self._processes)} workers.")
+
+    def monitor_and_restart(self):
+        """Check for dead workers, reclaim their SHM, and restart them."""
+        if self._stop_event.is_set():
+            return
+            
+        dead_pids = []
+        for pid, (node, p) in list(self._processes.items()):
+            if not p.is_alive():
+                logger.warning(f"Worker {node.name} (pid {pid}) died! Reclaiming SHM and restarting...")
+                dead_pids.append(pid)
+        
+        for pid in dead_pids:
+            # 1. Reclaim SHM if the worker was processing a task
+            if pid in self._active_tasks:
+                msg = self._active_tasks.pop(pid)
+                logger.info(f"Reclaiming SHM for task {msg.id} from dead worker {pid}")
+                try:
+                    free_payload(msg.payload, pool=self._pool)
+                except Exception as e:
+                    logger.error(f"Failed to reclaim SHM for task {msg.id}: {e}")
+            else:
+                logger.info(f"No active task found for dead worker {pid}")
+
+            # 2. Restart worker
+            node, _ = self._processes.pop(pid)
+            self._start_worker(node)
+
+    def get_pool_status(self) -> dict:
+        if self._pool:
+            return self._pool.get_status()
+        return {}
+
+    def put(self, payload: Any, partition: str, msg_type: str = 'task', priority: int = 50):
+        """Inject a message into the pipeline."""
+        if not self._queue:
+            self.build()
+            
+        msg = Message(payload=payload, priority=priority, msg_type=msg_type)
+        # If payload contains numpy arrays, pack them
+        packed = pack_payload(msg.payload, self._pool)
+        msg.payload = packed
+        self._queue.put(msg, partition=partition)
+        
+        # Update metrics
+        p_metrics = self.metrics.get("pipeline")
+        if p_metrics is not None:
+            p_metrics["input_count"] += 1
+            self.metrics["pipeline"] = p_metrics
+
+    def get_result(self, partition: str, timeout: Optional[float] = None, msg_filter: Optional[callable] = None) -> Message:
+        """Fetch a result from the pipeline."""
+        if not self._queue:
+            self.build()
+            
+        msg = self._queue.get(partition=partition, block=True, timeout=timeout, msg_filter=msg_filter)
+        if msg:
+            # Update metrics
+            p_metrics = self.metrics.get("pipeline")
+            if p_metrics is not None:
+                p_metrics["output_count"] += 1
+                self.metrics["pipeline"] = p_metrics
+            
+            # Automatically free SHM for the result message
+            free_payload(msg.payload, pool=self._pool)
+            
+        return msg
+
+    def stop(self):
+        """
+        Gracefully shut down all nodes.
+        
+        The shutdown process follows these steps:
+        1. Set the global stop event to signal all loops to exit.
+        2. Send high-priority 'shutdown' messages to all partitions.
+        3. Wait in parallel for all processes to exit (up to 2 seconds).
+        4. Forcefully terminate any remaining processes.
+        5. Cleanup Shared Memory and Queues.
+        """
+        if getattr(self, '_stopping', False):
+            return
+        self._stopping = True
+        
+        logger.info("Stopping pipeline...")
+        self._stop_event.set()
+        
+        # 1. Send shutdown messages to all partitions (non-blocking)
+        if self._queue:
+            for node in self._nodes:
+                for _ in range(node.num_workers):
+                    try:
+                        shutdown_msg = Message(payload={'target': node.name}, priority=1000, msg_type='shutdown')
+                        self._queue.put(shutdown_msg, partition=node.input_partition, block=False)
+                    except Exception:
+                        pass
+        
+        # 2. Wait for processes to exit gracefully (parallel wait)
+        start_wait = time.time()
+        grace_period = 1.0 # Reduced grace period
+        while time.time() - start_wait < grace_period:
+            alive_pids = [pid for pid, (node, p) in self._processes.items() if p.is_alive()]
+            if not alive_pids:
+                break
+            time.sleep(0.1)
+            
+        # 3. Terminate remaining processes
+        for pid, (node, p) in self._processes.items():
+            if p.is_alive():
+                try:
+                    p.terminate()
+                except Exception:
+                    pass
+        
+        # 4. Final join with short timeout and kill fallback
+        for pid, (node, p) in self._processes.items():
+            try:
+                p.join(timeout=0.1)
+                if p.is_alive():
+                    p.kill() # SIGKILL
+                    p.join(timeout=0.1)
+            except Exception:
+                pass
+        
+        # 5. Cleanup resources (with error handling to avoid hangs)
+        try:
+            if self._pool:
+                # pool.close() now has internal timeouts
+                self._pool.close()
+        except Exception as e:
+            logger.warning(f"Error closing pool: {e}")
+
+        try:
+            if self._queue:
+                self._queue.close()
+        except Exception as e:
+            logger.warning(f"Error closing queue: {e}")
+            
+        # 6. Shutdown manager (last step, might hang if proxies are still active)
+        # We skip this if we are in a hurry or if it's known to hang
+        # try:
+        #     self._manager.shutdown()
+        # except Exception:
+        #     pass
+            
+        logger.info("Pipeline stopped.")
