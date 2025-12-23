@@ -39,3 +39,5 @@ p.add_node(producer)
 p.add_node(consumer)
 p.run()
 ```
+
+![alt text](asset/image.png)
