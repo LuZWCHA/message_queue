@@ -42,6 +42,8 @@ _EPHEMERAL_SHM: Set[str] = set()
 _ALL_CREATED_SHM: Set[str] = set() # Track all SHM created by this process
 _SHM_LOCK = threading.RLock()
 _DEFAULT_POOL: Optional[SharedMemoryPool] = None
+_SHARED_SHM_REGISTRY: Optional[List[str]] = None
+_I_AM_SHM_MASTER: bool = False
 
 
 def set_default_pool(pool: SharedMemoryPool):
@@ -53,36 +55,65 @@ def get_default_pool() -> Optional[SharedMemoryPool]:
     return _DEFAULT_POOL
 
 
+def set_shm_registry(registry: Optional[List[str]]):
+    global _SHARED_SHM_REGISTRY
+    _SHARED_SHM_REGISTRY = registry
+
+
+def set_shm_master(is_master: bool = True):
+    global _I_AM_SHM_MASTER
+    _I_AM_SHM_MASTER = is_master
+
+
 def _cleanup_shm():
     """Global cleanup for shared memory to prevent leaks on exit/crash."""
-    with _SHM_LOCK:
-        # 1. Cleanup pools (Manager-dependent, might hang)
-        for pool in list(_SHM_POOLS):
-            try:
-                pool.close()
-            except Exception:
-                pass
-        _SHM_POOLS.clear()
+    # Use a flag to avoid re-entry hangs
+    if getattr(_cleanup_shm, '_running', False):
+        return
+    _cleanup_shm._running = True
+    
+    try:
+        with _SHM_LOCK:
+            # 1. Cleanup pools (Manager-dependent, might hang)
+            for pool in list(_SHM_POOLS):
+                try:
+                    # Use a very short timeout for pool closure during global cleanup
+                    pool.close()
+                except Exception:
+                    pass
+            _SHM_POOLS.clear()
 
-        # 2. Cleanup all SHM created by this process (Manager-independent, safe)
-        for name in list(_ALL_CREATED_SHM):
-            try:
-                shm = shared_memory.SharedMemory(name=name)
-                shm.unlink()
-                shm.close()
-            except Exception:
-                pass
-        _ALL_CREATED_SHM.clear()
-        _EPHEMERAL_SHM.clear()
+            # 2. Cleanup all SHM created by this process (Manager-independent, safe)
+            for name in list(_ALL_CREATED_SHM):
+                try:
+                    from multiprocessing import shared_memory
+                    shm = shared_memory.SharedMemory(name=name)
+                    shm.unlink()
+                    shm.close()
+                except Exception:
+                    pass
+            _ALL_CREATED_SHM.clear()
+            _EPHEMERAL_SHM.clear()
 
-
-def _signal_handler(signum, frame):
-    # logger.info(f"Received signal {signum}, cleaning up shared memory...")
-    _cleanup_shm()
-    # Re-raise or exit
-    if signum == signal.SIGINT:
-        raise KeyboardInterrupt
-    exit(1)
+            # 3. Cleanup from shared registry if available (Manager-dependent)
+            # ONLY the master process should do this to avoid redundant work and hangs in workers
+            if _I_AM_SHM_MASTER and _SHARED_SHM_REGISTRY is not None:
+                try:
+                    # list() on a Manager.list() can hang if Manager is dead/stuck
+                    # We try to copy it quickly. 
+                    shm_names = list(_SHARED_SHM_REGISTRY)
+                    for name in shm_names:
+                        try:
+                            from multiprocessing import shared_memory
+                            shm = shared_memory.SharedMemory(name=name)
+                            shm.unlink()
+                            shm.close()
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+    finally:
+        _cleanup_shm._running = False
 
 
 class Empty(Exception):
@@ -279,9 +310,28 @@ class ManagerPriorityQueue(BasePriorityQueue):
         with self._lock:
             return len(self._list)
 
+    def cleanup_payloads(self, pool: Optional[SharedMemoryPool] = None) -> None:
+        """Free all payloads currently in the queue."""
+        # Use a timeout to avoid hanging if the lock is held by a dead process
+        if self._lock.acquire(timeout=2.0):
+            try:
+                for item in list(self._list):
+                    try:
+                        # item is (priority, counter, ts, data)
+                        msg = Message.deserialize(item[3])
+                        free_payload(msg.payload, pool=pool)
+                    except Exception:
+                        pass
+                self._list[:] = []
+            finally:
+                self._lock.release()
+
     def close(self) -> None:
-        with self._lock:
-            self._closed.value = True
+        if self._lock.acquire(timeout=2.0):
+            try:
+                self._closed.value = True
+            finally:
+                self._lock.release()
         if self._own_manager:
             try:
                 self._manager.shutdown()
@@ -539,15 +589,30 @@ class PartitionedPriorityQueue(BasePriorityQueue):
             return 0
         return self._queues[partition].size()
 
+    def cleanup_payloads(self, pool: Optional[SharedMemoryPool] = None) -> None:
+        """Free all payloads in all partitions."""
+        if self._lock.acquire(timeout=2.0):
+            try:
+                for q in list(self._queues.values()):
+                    try:
+                        q.cleanup_payloads(pool=pool)
+                    except Exception:
+                        pass
+            finally:
+                self._lock.release()
+
     def close(self) -> None:
-        with self._lock:
-            for q in self._queues.values():
-                try:
-                    q.close()
-                except Exception:
-                    pass
-            self._queues.clear()
-            self._capacities.clear()
+        if self._lock.acquire(timeout=2.0):
+            try:
+                for q in list(self._queues.values()):
+                    try:
+                        q.close()
+                    except Exception:
+                        pass
+                self._queues.clear()
+                self._capacities.clear()
+            finally:
+                self._lock.release()
         if self._own_manager:
             try:
                 self._manager.shutdown()
@@ -582,11 +647,19 @@ class SharedMemoryStore:
             _EPHEMERAL_SHM.add(shm.name)
             _ALL_CREATED_SHM.add(shm.name)
         
+        if _SHARED_SHM_REGISTRY is not None:
+            try:
+                _SHARED_SHM_REGISTRY.append(shm.name)
+            except Exception:
+                pass
+
         # Unregister from resource_tracker to avoid warnings on exit
         try:
-            from multiprocessing.resource_tracker import unregister
-            unregister(shm._name, 'shared_memory')
-        except (ImportError, AttributeError):
+            from multiprocessing import resource_tracker
+            # Try both _name and name just in case
+            name_to_unreg = getattr(shm, '_name', shm.name)
+            resource_tracker.unregister(name_to_unreg, 'shared_memory')
+        except Exception:
             pass
             
         # close in this process; other processes can attach by name
@@ -599,9 +672,10 @@ class SharedMemoryStore:
         
         # Unregister from resource_tracker to avoid warnings in workers
         try:
-            from multiprocessing.resource_tracker import unregister
-            unregister(shm._name, 'shared_memory')
-        except (ImportError, AttributeError):
+            from multiprocessing import resource_tracker
+            name_to_unreg = getattr(shm, '_name', shm.name)
+            resource_tracker.unregister(name_to_unreg, 'shared_memory')
+        except Exception:
             pass
 
         arr = np.ndarray(meta['shape'], dtype=np.dtype(meta['dtype']), buffer=shm.buf)
@@ -666,15 +740,21 @@ class SharedMemoryPool:
             # In Python 3.8+, we need to unregister from resource_tracker 
             # if we want to manage the lifecycle ourselves across processes.
             try:
-                from multiprocessing.resource_tracker import unregister
-                unregister(shm._name, 'shared_memory')
-            except (ImportError, AttributeError):
+                from multiprocessing import resource_tracker
+                name_to_unreg = getattr(shm, '_name', shm.name)
+                resource_tracker.unregister(name_to_unreg, 'shared_memory')
+            except Exception:
                 pass
             shm.close()
             alloc_list.append(name)
             free_list.append(name)
             with _SHM_LOCK:
                 _ALL_CREATED_SHM.add(name)
+            if _SHARED_SHM_REGISTRY is not None:
+                try:
+                    _SHARED_SHM_REGISTRY.append(name)
+                except Exception:
+                    pass
         # register for cleanup
         with _SHM_LOCK:
             _SHM_POOLS.add(pool)
@@ -716,6 +796,11 @@ class SharedMemoryPool:
                     self._alloc.append(name)
                     with _SHM_LOCK:
                         _ALL_CREATED_SHM.add(name)
+                    if _SHARED_SHM_REGISTRY is not None:
+                        try:
+                            _SHARED_SHM_REGISTRY.append(name)
+                        except Exception:
+                            pass
                 self._ref_counts[name] = 1
             finally:
                 self._lock.release()
@@ -727,9 +812,10 @@ class SharedMemoryPool:
         shm = shared_memory.SharedMemory(name=name)
         # Unregister here too
         try:
-            from multiprocessing.resource_tracker import unregister
-            unregister(shm._name, 'shared_memory')
-        except (ImportError, AttributeError):
+            from multiprocessing import resource_tracker
+            name_to_unreg = getattr(shm, '_name', shm.name)
+            resource_tracker.unregister(name_to_unreg, 'shared_memory')
+        except Exception:
             pass
         shm.buf[:nbytes] = arr.tobytes()
         shm.close()
@@ -761,7 +847,8 @@ class SharedMemoryPool:
 
                 if name in self._alloc:
                     # return to free list
-                    self._free.append(name)
+                    if name not in self._free:
+                        self._free.append(name)
                     return
             finally:
                 self._lock.release()
@@ -969,7 +1056,7 @@ def pack_payload(obj: Any, pool: Optional['SharedMemoryPool'] = None) -> Any:
             if pool:
                 return pool.store_array(obj)
             else:
-                return SharedMemoryStore.put(obj)
+                return SharedMemoryStore.store_array(obj)
         
         if isinstance(obj, dict):
             # detect if this dict *looks like* a shm meta
@@ -991,6 +1078,39 @@ def pack_payload(obj: Any, pool: Optional['SharedMemoryPool'] = None) -> Any:
         return obj
     except Exception:
         return obj
+
+
+def unpack_payload(payload: Any, pool: Optional['SharedMemoryPool'] = None, copy: bool = True) -> Any:
+    """
+    Recursively scan a payload and replace all Shared Memory metadata with actual arrays.
+    
+    This is the inverse of pack_payload. It ensures that the business logic
+    receives the original data format (e.g. numpy arrays) instead of SHM metadata.
+    """
+    # Accept Message instances
+    if isinstance(payload, Message):
+        payload = payload.payload
+
+    if isinstance(payload, dict):
+        # Check if this dict is a SHM meta
+        if payload.get('name') and (payload.get('shape') or payload.get('dtype') or 'pool' in payload):
+            try:
+                return SharedMemoryStore.load_array(payload, copy=copy)
+            except Exception:
+                return payload
+        
+        return {k: unpack_payload(v, pool, copy=copy) for k, v in payload.items()}
+    
+    if isinstance(payload, list):
+        return [unpack_payload(v, pool, copy=copy) for v in payload]
+    
+    if isinstance(payload, tuple):
+        return tuple(unpack_payload(v, pool, copy=copy) for v in payload)
+    
+    if isinstance(payload, np.ndarray) and copy:
+        return payload.copy()
+        
+    return payload
 
 
 def free_payload(payload: Any, pool: Optional['SharedMemoryPool'] = None) -> None:
@@ -1043,7 +1163,7 @@ def free_payload(payload: Any, pool: Optional['SharedMemoryPool'] = None) -> Non
         pass
 
 
-def run_worker_loop(queue: BasePriorityQueue, business_fn, desired_types, group: Optional[str] = None, pool: Optional['SharedMemoryPool'] = None, worker_name: Optional[str] = None, processing_delay: float = 0.0, partition: Optional[str] = None, result_partition: Optional[str] = None, result_msg_type: str = 'result', on_task_start: Optional[callable] = None, on_task_done: Optional[callable] = None, stop_event: Optional[multiprocessing.Event] = None):
+def run_worker_loop(queue: BasePriorityQueue, business_fn, desired_types, group: Optional[str] = None, pool: Optional['SharedMemoryPool'] = None, worker_name: Optional[str] = None, processing_delay: float = 0.0, partition: Optional[str] = None, result_partition: Optional[str] = None, result_msg_type: str = 'result', on_task_start: Optional[callable] = None, on_task_done: Optional[callable] = None, on_produce: Optional[callable] = None, stop_event: Optional[multiprocessing.Event] = None):
     """
     Standard execution loop for a pipeline node worker.
     
@@ -1068,6 +1188,7 @@ def run_worker_loop(queue: BasePriorityQueue, business_fn, desired_types, group:
         result_msg_type: Type for the output message.
         on_task_start: Callback when a task is acquired.
         on_task_done: Callback when a task is finished.
+        on_produce: Callback when an item is produced (sent to next stage).
         stop_event: Event to signal graceful shutdown.
     """
     if pool is None:
@@ -1092,15 +1213,19 @@ def run_worker_loop(queue: BasePriorityQueue, business_fn, desired_types, group:
                 except Exception:
                     pass
 
-            payload = msg.payload
+            # Unpack the entire payload so it contains original objects (like numpy arrays)
+            # instead of SHM metadata.
+            unpacked_payload = unpack_payload(msg.payload, pool=pool, copy=True)
+            
             arr = None
             try:
-                # load array if present
-                arr = load_array_from_payload(payload)
+                # For backward compatibility, still try to find the "main" array if it exists.
+                # We use copy=False because unpacked_payload already contains copies.
+                arr = load_array_from_payload(unpacked_payload, copy=False)
 
                 # call business logic
                 try:
-                    result = business_fn(arr, payload, msg)
+                    result = business_fn(arr, unpacked_payload, msg)
                 except Exception:
                     logger.exception(f"{name} business_fn error")
                     result = None
@@ -1109,18 +1234,39 @@ def run_worker_loop(queue: BasePriorityQueue, business_fn, desired_types, group:
                     time.sleep(processing_delay)
 
                 if result is not None:
-                    # delegate packing to the message-queue layer
-                    packed_payload = pack_payload(result, pool)
-                    res_msg = Message(payload=packed_payload, priority=50, msg_type=result_msg_type)
-                    try:
-                        _put(queue, res_msg, partition=result_partition)
-                    except Exception:
-                        # on failure, attempt fallback: send original result inline
-                        res_msg = Message(payload=result, priority=50, msg_type=result_msg_type)
-                        _put(queue, res_msg, partition=result_partition)
+                    # Handle generators for one-to-many mapping
+                    if hasattr(result, "__next__") and hasattr(result, "__iter__"):
+                        try:
+                            for item in result:
+                                if item is None: continue
+                                packed_payload = pack_payload(item, pool)
+                                res_msg = Message(payload=packed_payload, priority=50, msg_type=result_msg_type)
+                                _put(queue, res_msg, partition=result_partition)
+                                if on_produce:
+                                    try:
+                                        on_produce(item)
+                                    except Exception:
+                                        pass
+                        except Exception:
+                            logger.exception(f"{name} generator error")
+                    else:
+                        # delegate packing to the message-queue layer
+                        packed_payload = pack_payload(result, pool)
+                        res_msg = Message(payload=packed_payload, priority=50, msg_type=result_msg_type)
+                        try:
+                            _put(queue, res_msg, partition=result_partition)
+                            if on_produce:
+                                try:
+                                    on_produce(result)
+                                except Exception:
+                                    pass
+                        except Exception:
+                            # on failure, attempt fallback: send original result inline
+                            res_msg = Message(payload=result, priority=50, msg_type=result_msg_type)
+                            _put(queue, res_msg, partition=result_partition)
             finally:
                 # free input buffer even if business_fn or packing fails
-                free_payload(payload, pool=pool)
+                free_payload(msg.payload, pool=pool)
                 if on_task_done:
                     try:
                         on_task_done(msg)
@@ -1229,6 +1375,13 @@ def demo(num_workers: int = 3, num_tasks: int = 10, cascade_levels: int = 3):
 
 # Register cleanup
 atexit.register(_cleanup_shm)
+
+def _signal_handler(signum, frame):
+    _cleanup_shm()
+    if signum == signal.SIGINT:
+        raise KeyboardInterrupt
+    os._exit(1)
+
 signal.signal(signal.SIGINT, _signal_handler)
 signal.signal(signal.SIGTERM, _signal_handler)
 

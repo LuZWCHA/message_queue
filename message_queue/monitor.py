@@ -18,6 +18,7 @@ DASHBOARD_HTML = """
 <!DOCTYPE html>
 <html>
 <head>
+    <meta charset="UTF-8">
     <title>Pipeline Monitor Pro</title>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@500;700&display=swap" rel="stylesheet">
@@ -182,8 +183,8 @@ DASHBOARD_HTML = """
 
         .topo-node {
             position: absolute;
-            width: 160px;
-            height: 80px;
+            width: 180px;
+            height: 95px;
             background: rgba(15, 23, 42, 0.8);
             backdrop-filter: blur(8px);
             border: 1px solid var(--card-border);
@@ -426,6 +427,7 @@ DASHBOARD_HTML = """
 
         const nodeColors = {};
         const lastSuccessCount = {};
+        const lastProducedCount = {};
         const nodePositions = {};
 
         function animateMarble(fromPos, toPos) {
@@ -519,12 +521,12 @@ DASHBOARD_HTML = """
                 const idx = currentLayerIdx[l] || 0;
                 const totalInLayer = nodesPerLayer[l];
                 
-                const x = 120 + l * 280;
-                const spacing = 130;
-                const startY = (500 - (totalInLayer * spacing - (spacing - 80))) / 2;
+                const x = 100 + l * 320;
+                const spacing = 140;
+                const startY = (500 - (totalInLayer * spacing - (spacing - 95))) / 2;
                 const y = startY + idx * spacing;
                 
-                nodePositions[n] = { x, y, centerX: x + 80, centerY: y + 40 };
+                nodePositions[n] = { x, y, centerX: x + 90, centerY: y + 47.5 };
                 currentLayerIdx[l] = idx + 1;
 
                 let nodeEl = document.getElementById(`topo-${n}`);
@@ -537,13 +539,19 @@ DASHBOARD_HTML = """
                 nodeEl.style.left = `${x}px`;
                 nodeEl.style.top = `${y}px`;
                 const latencyMs = ((nodesData[n].latency || 0) * 1000).toFixed(1);
+                const inRate = nodesData[n].rate || 0;
+                const outRate = nodesData[n].produced_rate || 0;
+                
                 nodeEl.innerHTML = `
                     <div class="node-header">
                         <div class="node-name">${n}</div>
                         <div class="node-status-dot"></div>
                     </div>
-                    <div class="node-body">
-                        <div class="node-rate">${nodesData[n].rate || 0}</div>
+                    <div class="node-body" style="display: flex; justify-content: space-between; align-items: flex-end;">
+                        <div style="display: flex; flex-direction: column; gap: 2px;">
+                            <div style="font-size: 14px; font-weight: 700; color: var(--accent-primary); font-family: var(--font-mono);">IN: ${inRate.toFixed(2)}</div>
+                            <div style="font-size: 12px; font-weight: 600; color: var(--success); font-family: var(--font-mono);">OUT: ${outRate.toFixed(2)}</div>
+                        </div>
                         <div class="node-latency">${latencyMs}ms</div>
                     </div>
                 `;
@@ -559,24 +567,35 @@ DASHBOARD_HTML = """
                 }
 
                 adj[u].forEach(v => {
-                    const startPos = { x: nodePositions[u].x + 160, y: nodePositions[u].centerY };
+                    const startPos = { x: nodePositions[u].x + 180, y: nodePositions[u].centerY };
                     const endPos = { x: nodePositions[v].x, y: nodePositions[v].centerY };
                     drawLink(`line-${u}-${v}`, startPos, endPos);
-                    if (lastSuccessCount[u] !== undefined && nodesData[u].success > lastSuccessCount[u]) {
-                        animateMarble(startPos, endPos);
+                    
+                    const diff = nodesData[u].produced - (lastProducedCount[u] || 0);
+                    if (lastProducedCount[u] !== undefined && diff > 0) {
+                        const numMarbles = Math.min(diff, 5);
+                        for (let i = 0; i < numMarbles; i++) {
+                            setTimeout(() => animateMarble(startPos, endPos), i * (1000 / numMarbles));
+                        }
                     }
                 });
 
                 if (adj[u].length === 0) {
-                    const startPos = { x: nodePositions[u].x + 160, y: nodePositions[u].centerY };
-                    const endPos = { x: nodePositions[u].x + 260, y: nodePositions[u].centerY };
+                    const startPos = { x: nodePositions[u].x + 180, y: nodePositions[u].centerY };
+                    const endPos = { x: nodePositions[u].x + 280, y: nodePositions[u].centerY };
                     drawLink(`line-${u}-out`, startPos, endPos);
                     const endLabel = document.getElementById('topo-end');
                     endLabel.style.left = `${endPos.x + 10}px`;
-                    if (lastSuccessCount[u] !== undefined && nodesData[u].success > lastSuccessCount[u]) {
-                        animateMarble(startPos, endPos);
+                    
+                    const diff = nodesData[u].produced - (lastProducedCount[u] || 0);
+                    if (lastProducedCount[u] !== undefined && diff > 0) {
+                        const numMarbles = Math.min(diff, 5);
+                        for (let i = 0; i < numMarbles; i++) {
+                            setTimeout(() => animateMarble(startPos, endPos), i * (1000 / numMarbles));
+                        }
                     }
                 }
+                lastProducedCount[u] = nodesData[u].produced;
                 lastSuccessCount[u] = nodesData[u].success;
             });
         }
@@ -631,7 +650,12 @@ DASHBOARD_HTML = """
                         html += `
                             <div class="node-stat-row">
                                 <span class="stat-label">${name}</span>
-                                <span class="stat-value">${stats.success} OK / ${stats.fail} ERR</span>
+                                <div style="text-align: right">
+                                    <div class="stat-value">${stats.success} OK / ${stats.fail} ERR</div>
+                                    <div style="font-size: 10px; color: var(--text-muted); font-family: var(--font-mono)">
+                                        IN: ${(stats.rate || 0).toFixed(2)} | OUT: ${(stats.produced_rate || 0).toFixed(2)}
+                                    </div>
+                                </div>
                             </div>
                         `;
 
@@ -673,10 +697,14 @@ DASHBOARD_HTML = """
 
                 // Animate input marble
                 if (window.lastInputCount !== undefined && window.p_in_count > window.lastInputCount) {
+                    const diff = window.p_in_count - window.lastInputCount;
+                    const numMarbles = Math.min(diff, 5);
                     Object.keys(data.nodes).forEach(n => {
                         const isEntry = !Object.values(data.nodes).some(other => other.output === data.nodes[n].input && other.output);
                         if (isEntry && nodePositions[n]) {
-                            animateMarble({x: 40, y: nodePositions[n].centerY}, {x: nodePositions[n].x, y: nodePositions[n].centerY});
+                            for (let i = 0; i < numMarbles; i++) {
+                                setTimeout(() => animateMarble({x: 40, y: nodePositions[n].centerY}, {x: nodePositions[n].x, y: nodePositions[n].centerY}), i * (1000 / numMarbles));
+                            }
                         }
                     });
                 }
@@ -702,12 +730,12 @@ class MetricsHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == '/':
             self.send_response(200)
-            self.send_header('Content-type', 'text/html')
+            self.send_header('Content-type', 'text/html; charset=utf-8')
             self.end_headers()
-            self.wfile.write(DASHBOARD_HTML.encode())
+            self.wfile.write(DASHBOARD_HTML.encode('utf-8'))
         elif self.path == '/api/metrics':
             self.send_response(200)
-            self.send_header('Content-type', 'application/json')
+            self.send_header('Content-type', 'application/json; charset=utf-8')
             self.end_headers()
             try:
                 # Convert proxy dict to real dict for JSON serialization

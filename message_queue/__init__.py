@@ -16,11 +16,13 @@ from .message_queue import (
     SharedMemoryPool,
     run_worker_loop,
     pack_payload,
+    unpack_payload,
     free_payload,
     set_default_pool,
     get_default_pool,
     acquire_for_group,
     load_array_from_payload,
+    _cleanup_shm,
     Empty,
     Full
 )
