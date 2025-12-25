@@ -49,7 +49,7 @@ class PipelineNode(ABC):
     
     def __init__(self, name: str, num_workers: int = 1, input_partition: Optional[str] = None, 
                  output_partition: Optional[str] = None, result_msg_type: str = 'task',
-                 priority: int = 50, processing_delay: float = 0.0, capacity: Optional[int] = None):
+                 priority: int = 50, processing_delay: float = 0.0, capacity: Optional[int] = None, **kwargs):
         self.name = name
         self.num_workers = num_workers
         self.input_partition = input_partition
@@ -59,6 +59,9 @@ class PipelineNode(ABC):
         self.processing_delay = processing_delay
         self.capacity = capacity
         self.logger = logging.getLogger(f"{__name__}.{name}")
+        
+        for k, v in kwargs.items():
+            setattr(self, k, v)
 
     def log(self, level: int, msg: str, *args, **kwargs):
         """Log a message with node context."""
@@ -100,11 +103,11 @@ class SimpleNode(PipelineNode):
                  setup_fn: Optional[callable] = None, 
                  teardown_fn: Optional[callable] = None, **kwargs):
         name = name or fn.__name__
+        self.context = kwargs.pop('context', None)
         super().__init__(name=name, **kwargs)
         self.fn = fn
         self.setup_fn = setup_fn
         self.teardown_fn = teardown_fn
-        self.context = None
         import inspect
         self._params_count = len(inspect.signature(fn).parameters)
 
@@ -113,8 +116,27 @@ class SimpleNode(PipelineNode):
         if self.setup_fn:
             import inspect
             sig = inspect.signature(self.setup_fn)
-            if len(sig.parameters) > 0:
-                self.context = self.setup_fn(worker_id)
+            params = list(sig.parameters.keys())
+            
+            if len(params) > 0:
+                args = []
+                # First argument is worker_id
+                args.append(worker_id)
+                
+                # For the rest, try to find them in node attributes
+                for param_name in params[1:]:
+                    if hasattr(self, param_name):
+                        args.append(getattr(self, param_name))
+                    else:
+                        # If not found, we might have a problem, but let's try to call it anyway
+                        # or maybe it's a default argument
+                        pass
+                
+                try:
+                    self.context = self.setup_fn(*args)
+                except TypeError:
+                    # Fallback to just worker_id if positional args fail
+                    self.context = self.setup_fn(worker_id)
             else:
                 self.context = self.setup_fn()
 
@@ -352,12 +374,16 @@ class Pipeline:
                 
             time.sleep(check_interval)
 
-    def add_node(self, node: Union[PipelineNode, callable]) -> Pipeline:
+    def add_node(self, node: Union[PipelineNode, callable], **kwargs) -> Pipeline:
         if not isinstance(node, PipelineNode) and callable(node):
             if hasattr(node, "_pipeline_node"):
                 node = getattr(node, "_pipeline_node")
             else:
                 node = SimpleNode(node)
+        
+        # Apply extra configuration
+        for k, v in kwargs.items():
+            setattr(node, k, v)
             
         self._nodes.append(node)
         
@@ -378,9 +404,9 @@ class Pipeline:
         logger.info(f"Added node '{node.name}' to pipeline (workers: {node.num_workers}, input: {node.input_partition})")
         return self
 
-    def add(self, node: Union[PipelineNode, callable]) -> Pipeline:
+    def add(self, node: Union[PipelineNode, callable], **kwargs) -> Pipeline:
         """Alias for add_node."""
-        return self.add_node(node)
+        return self.add_node(node, **kwargs)
 
     def run(self, monitor_port: Optional[int] = 8000, capacities: Optional[Dict[str, int]] = None, check_interval: float = 1.0):
         """

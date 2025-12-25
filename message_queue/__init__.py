@@ -23,6 +23,8 @@ from .message_queue import (
     acquire_for_group,
     load_array_from_payload,
     _cleanup_shm,
+    set_shm_registry,
+    set_shm_master,
     Empty,
     Full
 )

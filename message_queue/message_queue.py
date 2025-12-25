@@ -767,15 +767,7 @@ class SharedMemoryPool:
             # fallback to ephemeral allocation
             meta = SharedMemoryStore.store_array(arr)
             meta['pool'] = False
-            # Use timeout for lock to avoid deadlocks during shutdown
-            if self._lock.acquire(timeout=2.0):
-                try:
-                    self._ref_counts[meta['name']] = 1
-                finally:
-                    self._lock.release()
-            else:
-                logger.warning(f"Failed to acquire pool lock for ephemeral array {meta['name']}")
-                self._ref_counts[meta['name']] = 1 # Best effort
+            # Ephemeral segments are tracked by SharedMemoryStore; skip pool lock to avoid noisy warnings
             return meta
 
         name = None
