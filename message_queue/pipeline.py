@@ -238,7 +238,8 @@ class Pipeline:
     """
     
     def __init__(self, manager: Optional[Any] = None, 
-                 pool_size: int = 16, block_size: int = 1024*1024*3):
+                 pool_size: int = 16, block_size: int = 1024*1024*3,
+                 enable_metrics: bool = True, metrics_sample_rate: float = 1.0, metrics_sample_every: int = 1):
         self._manager = manager or multiprocessing.Manager()
         self._nodes: List[PipelineNode] = []
         self._pool_size = pool_size
@@ -248,6 +249,16 @@ class Pipeline:
         self._processes: Dict[int, tuple] = {} # pid -> (node, process_obj)
         self._active_tasks = self._manager.dict() # pid -> Message
         self._stop_event = multiprocessing.Event()
+
+        # Restart backoff (exponential) to avoid thrashing when workers keep dying
+        self._restart_backoff = 0.0
+        self._restart_backoff_base = 0.1
+        self._restart_backoff_max = 5.0
+
+        # Metrics sampling controls
+        self.enable_metrics = enable_metrics
+        self.metrics_sample_rate = metrics_sample_rate
+        self.metrics_sample_every = metrics_sample_every
         
         # Metrics for monitoring
         self.metrics = self._manager.dict()
@@ -332,6 +343,13 @@ class Pipeline:
                     last_produced = self._last_metrics_snapshot.get(f"node_{node_name}_prod", 0)
                     stats["produced_rate"] = round((curr_produced - last_produced) / dt, 2)
                     self._last_metrics_snapshot[f"node_{node_name}_prod"] = curr_produced
+
+                    # Update worker liveness counts
+                    alive = 0
+                    for pid, (proc_node, proc, *_) in list(self._processes.items()):
+                        if proc_node.name == node_name and proc.is_alive():
+                            alive += 1
+                    stats["workers_alive"] = alive
                     
                     n_metrics[node_name] = stats # Trigger sync
                 
@@ -405,7 +423,12 @@ class Pipeline:
             "produced_rate": 0.0,
             "latency": 0.0,
             "input": node.input_partition,
-            "output": node.output_partition
+            "output": node.output_partition,
+            "pct_get": 0.0,
+            "pct_put": 0.0,
+            "pct_fn": 0.0,
+            "workers_total": node.num_workers,
+            "workers_alive": 0
         }
         self.metrics["nodes"] = n_metrics
         
@@ -459,7 +482,8 @@ class Pipeline:
 
     @staticmethod
     def _worker_entry(node: PipelineNode, queue: PartitionedPriorityQueue, pool: SharedMemoryPool, 
-                      active_tasks: dict, metrics: dict, stop_event: Any, shm_registry: Optional[List[str]] = None, worker_id: int = 0):
+                      active_tasks: dict, metrics: dict, stop_event: Any, shm_registry: Optional[List[str]] = None, worker_id: int = 0,
+                      enable_metrics: bool = True, metrics_sample_rate: float = 1.0, metrics_sample_every: int = 1):
         """Entry point for worker processes."""
         set_default_pool(pool)
         if shm_registry is not None:
@@ -504,6 +528,15 @@ class Pipeline:
                 del active_tasks[pid]
             
             duration = time.time() - msg.payload.get('_start_time', time.time())
+            t_get = t_put = t_fn = total_t = 0.0
+            if isinstance(msg.payload, dict):
+                item_cnt = msg.payload.get('_generator_item_count', 0)
+                if item_cnt:
+                    duration = duration / max(item_cnt, 1)
+                t_get = msg.payload.get('_t_get', 0.0)
+                t_put = msg.payload.get('_t_put', 0.0)
+                t_fn = msg.payload.get('_t_fn', 0.0)
+                total_t = t_get + t_put + t_fn
             
             # Update metrics
             try:
@@ -522,6 +555,16 @@ class Pipeline:
                         # Moving average for latency
                         curr_lat = stats.get("latency", 0.0)
                         stats["latency"] = round(curr_lat * 0.9 + duration * 0.1, 4)
+
+                        # Time proportion smoothing
+                        if isinstance(msg.payload, dict):
+                            if total_t > 0:
+                                pct_get = t_get / total_t
+                                pct_put = t_put / total_t
+                                pct_fn = t_fn / total_t
+                                stats["pct_get"] = round(stats.get("pct_get", 0.0) * 0.9 + pct_get * 0.1, 4)
+                                stats["pct_put"] = round(stats.get("pct_put", 0.0) * 0.9 + pct_put * 0.1, 4)
+                                stats["pct_fn"] = round(stats.get("pct_fn", 0.0) * 0.9 + pct_fn * 0.1, 4)
                         
                         n_metrics[node.name] = stats # Update the Manager.dict
                         metrics_proxy["nodes"] = n_metrics # Ensure top-level sync
@@ -536,6 +579,11 @@ class Pipeline:
                 logger.error(f"Metrics update error in worker: {e}")
 
         try:
+            # Define a filter that only accepts messages targeted to this worker_id or untargeted messages
+            def worker_msg_filter(m: Message) -> bool:
+                target_id = m.meta.get('target_worker_id')
+                return target_id is None or target_id == worker_id
+
             node.setup(worker_id=worker_id)
             run_worker_loop(
                 queue=queue,
@@ -551,7 +599,11 @@ class Pipeline:
                 on_task_start=on_start,
                 on_task_done=on_done,
                 on_produce=on_produce,
-                stop_event=stop_event
+                stop_event=stop_event,
+                enable_metrics=enable_metrics,
+                metrics_sample_rate=metrics_sample_rate,
+                metrics_sample_every=metrics_sample_every,
+                msg_filter=worker_msg_filter
             )
         except Exception as e:
             node.error(f"Crashed with exception: {e}", exc_info=True)
@@ -591,7 +643,8 @@ class Pipeline:
         p = multiprocessing.Process(
             target=self._worker_entry, 
             args=(node, self._queue, self._pool, self._active_tasks, self.metrics, self._stop_event, 
-                  getattr(self, '_shm_registry', None), worker_id),
+                  getattr(self, '_shm_registry', None), worker_id, 
+                  self.enable_metrics, self.metrics_sample_rate, self.metrics_sample_every),
             daemon=True
         )
         p.start()
@@ -622,20 +675,40 @@ class Pipeline:
         
         for pid in dead_pids:
             # 1. Reclaim SHM if the worker was processing a task
-            if pid in self._active_tasks:
-                msg = self._active_tasks.pop(pid)
-                logger.info(f"Reclaiming SHM for task {msg.id} from dead worker {pid}")
-                try:
-                    free_payload(msg.payload, pool=self._pool)
-                except Exception as e:
-                    logger.error(f"Failed to reclaim SHM for task {msg.id}: {e}")
-            else:
-                logger.info(f"No active task found for dead worker {pid}")
-
-            # 2. Restart worker
             info = self._processes.pop(pid)
             node, _, worker_id = info
+
+            if pid in self._active_tasks:
+                msg = self._active_tasks.pop(pid)
+                try:
+                    # Tag the message so only the restarted worker with the same worker_id can pick it up
+                    if msg.meta is None:
+                        msg.meta = {}
+                    msg.meta['target_worker_id'] = worker_id
+                    
+                    # Put the in-flight task back to the same partition
+                    self._queue.put(msg, partition=node.input_partition, block=False)
+                    logger.info(f"Requeued in-flight task {msg.id} from dead worker {pid} (worker_id {worker_id}) into partition {node.input_partition}")
+                except Exception as e:
+                    logger.error(f"Failed to requeue task {msg.id} from dead worker {pid}: {e}")
+                    try:
+                        free_payload(msg.payload, pool=self._pool)
+                    except Exception:
+                        pass
+            else:
+                logger.info(f"No active task found for dead worker {pid} (worker_id {worker_id})")
+
+            # 2. Restart worker
+            # Exponential backoff to avoid restart thrash; reset when stable
+            if self._restart_backoff > 0:
+                time.sleep(self._restart_backoff)
             self._start_worker(node, worker_id=worker_id)
+            next_backoff = self._restart_backoff * 2 if self._restart_backoff > 0 else self._restart_backoff_base
+            self._restart_backoff = min(self._restart_backoff_max, next_backoff)
+
+        if not dead_pids:
+            # Reset backoff when the system is stable
+            self._restart_backoff = 0.0
 
     def get_pool_status(self) -> dict:
         if self._pool:
@@ -659,12 +732,16 @@ class Pipeline:
             p_metrics["input_count"] += 1
             self.metrics["pipeline"] = p_metrics
 
-    def get_result(self, partition: str, timeout: Optional[float] = None, msg_filter: Optional[callable] = None) -> Message:
+    def get_result(self, partition: str, timeout: Optional[float] = None, msg_filter: Optional[callable] = None) -> Optional[Message]:
         """Fetch a result from the pipeline."""
         if not self._queue:
             self.build()
             
-        msg = self._queue.get(partition=partition, block=True, timeout=timeout, msg_filter=msg_filter)
+        try:
+            msg = self._queue.get(partition=partition, block=True, timeout=timeout, msg_filter=msg_filter)
+        except Exception: # Catch Empty or other queue errors
+            return None
+            
         if msg:
             # Update metrics
             p_metrics = self.metrics.get("pipeline")

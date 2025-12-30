@@ -226,6 +226,12 @@ DASHBOARD_HTML = """
             background: var(--success);
             border-radius: 50%;
             box-shadow: 0 0 8px var(--success);
+            transition: background 0.3s ease, box-shadow 0.3s ease;
+        }
+
+        .node-status-dot.off {
+            background: var(--danger);
+            box-shadow: 0 0 8px var(--danger);
         }
 
         .node-body {
@@ -541,18 +547,24 @@ DASHBOARD_HTML = """
                 const latencyMs = ((nodesData[n].latency || 0) * 1000).toFixed(1);
                 const inRate = nodesData[n].rate || 0;
                 const outRate = nodesData[n].produced_rate || 0;
+                const alive = nodesData[n].workers_alive || 0;
+                const total = nodesData[n].workers_total || 0;
+                const isAlive = alive > 0;
                 
                 nodeEl.innerHTML = `
                     <div class="node-header">
                         <div class="node-name">${n}</div>
-                        <div class="node-status-dot"></div>
+                        <div class="node-status-dot ${isAlive ? '' : 'off'}"></div>
                     </div>
                     <div class="node-body" style="display: flex; justify-content: space-between; align-items: flex-end;">
                         <div style="display: flex; flex-direction: column; gap: 2px;">
                             <div style="font-size: 14px; font-weight: 700; color: var(--accent-primary); font-family: var(--font-mono);">IN: ${inRate.toFixed(2)}</div>
                             <div style="font-size: 12px; font-weight: 600; color: var(--success); font-family: var(--font-mono);">OUT: ${outRate.toFixed(2)}</div>
                         </div>
-                        <div class="node-latency">${latencyMs}ms</div>
+                        <div class="node-latency" style="text-align: right;">
+                            <div>${latencyMs}ms</div>
+                            <div style="font-size:10px; color: var(--text-muted);">${alive}/${total} alive</div>
+                        </div>
                     </div>
                 `;
             });
@@ -636,6 +648,7 @@ DASHBOARD_HTML = """
                 
                 const statusEl = document.getElementById('conn-status');
                 statusEl.innerText = 'Live System';
+                statusEl.style.color = 'var(--success)';
 
                 if (data.pool) {
                     const used = data.pool.used_size || 0;
@@ -666,7 +679,10 @@ DASHBOARD_HTML = """
                                 <div style="text-align: right">
                                     <div class="stat-value">${stats.success} OK / ${stats.fail} ERR</div>
                                     <div style="font-size: 10px; color: var(--text-muted); font-family: var(--font-mono)">
-                                        IN: ${(stats.rate || 0).toFixed(2)} | OUT: ${(stats.produced_rate || 0).toFixed(2)}
+                                        IN: ${(stats.rate || 0).toFixed(2)} | OUT: ${(stats.produced_rate || 0).toFixed(2)} | LIVE: ${stats.workers_alive || 0}/${stats.workers_total || 0}
+                                    </div>
+                                    <div style="font-size: 10px; color: var(--text-muted); font-family: var(--font-mono)">
+                                         get ${(Math.round((stats.pct_get || 0) * 100))}% | put ${(Math.round((stats.pct_put || 0) * 100))}% | fn ${(Math.round((stats.pct_fn || 0) * 100))}%
                                     </div>
                                 </div>
                             </div>

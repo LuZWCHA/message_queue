@@ -22,6 +22,7 @@ import atexit
 import signal
 import os
 import contextlib
+import random
 from dataclasses import dataclass, asdict
 from typing import Any, Optional, Tuple, List, Set, Iterable, Union, Dict, Callable
 import numpy as np
@@ -460,7 +461,7 @@ class PartitionedPriorityQueue(BasePriorityQueue):
         default_capacity: Default capacity for new partitions.
     """
 
-    def __init__(self, manager: Optional[Any] = None, partitions: Optional[dict] = None, default_capacity: int = 1024, stop_event: Optional[multiprocessing.Event] = None):
+    def __init__(self, manager: Optional[Any] = None, partitions: Optional[dict] = None, default_capacity: int = 1024, stop_event: Optional[Any] = None):
         self._own_manager = False
         if manager is None:
             self._manager = multiprocessing.Manager()
@@ -768,7 +769,7 @@ class SharedMemoryPool:
     If an array is larger than the total pool size, it falls back to ephemeral allocation.
     """
 
-    def __init__(self, free_ranges, allocations, ref_counts, lock, condition, total_size: int, prefix: str = 'shmpool', stop_event: Optional[multiprocessing.Event] = None):
+    def __init__(self, free_ranges, allocations, ref_counts, lock, condition, total_size: int, prefix: str = 'shmpool', stop_event: Optional[Any] = None):
         self._free_ranges = free_ranges # manager.list of (shm_name, offset, size)
         self._allocations = allocations # manager.dict of alloc_id -> (shm_name, offset, size)
         self._ref_counts = ref_counts
@@ -780,7 +781,7 @@ class SharedMemoryPool:
         self._shm_names = set() # Track all segments used by this pool
 
     @classmethod
-    def create(cls, manager: Any, pool_size: int = 8, block_size: int = 1024 * 1024, prefix: str = 'shmpool', stop_event: Optional[multiprocessing.Event] = None) -> 'SharedMemoryPool':
+    def create(cls, manager: Any, pool_size: int = 8, block_size: int = 1024 * 1024, prefix: str = 'shmpool', stop_event: Optional[Any] = None) -> 'SharedMemoryPool':
         total_size = pool_size * block_size
         shm = shared_memory.SharedMemory(create=True, size=total_size)
         shm_name = shm.name
@@ -1054,7 +1055,7 @@ class QueueMonitor:
 
 
 # Helper utilities for consumer simplification
-def acquire_for_group(queue: BasePriorityQueue, desired_types, group: Optional[str] = None, timeout: Optional[float] = None, poll_interval: float = 0.01, partition: Optional[str] = None) -> Message:
+def acquire_for_group(queue: BasePriorityQueue, desired_types, group: Optional[str] = None, timeout: Optional[float] = None, poll_interval: float = 0.01, partition: Optional[str] = None, msg_filter: Optional[callable] = None) -> Message:
     """Acquire a message atomically for a consumer group.
 
     This helper uses the queue's native `get` with a filter to ensure
@@ -1063,17 +1064,27 @@ def acquire_for_group(queue: BasePriorityQueue, desired_types, group: Optional[s
     desired_set = set(desired_types)
     
     def combined_filter(m: Message) -> bool:
-        # Match desired types
+        # 1. Match desired types
+        type_match = False
         if m.msg_type in desired_set:
-            return True
+            type_match = True
         # Match shutdown targeted to this group (or all)
-        if m.msg_type == 'shutdown':
+        elif m.msg_type == 'shutdown':
             if group is None:
-                return True
-            if isinstance(m.payload, dict):
+                type_match = True
+            elif isinstance(m.payload, dict):
                 target = m.payload.get('target')
-                return target in (None, group)
-        return False
+                if target in (None, group):
+                    type_match = True
+        
+        if not type_match:
+            return False
+            
+        # 2. Apply external filter if provided
+        if msg_filter is not None:
+            return msg_filter(m)
+            
+        return True
 
     return _get(queue, block=True, timeout=timeout, msg_filter=combined_filter, partition=partition)
 
@@ -1296,7 +1307,7 @@ def free_payload(payload: Any, pool: Optional['SharedMemoryPool'] = None) -> Non
         pass
 
 
-def run_worker_loop(queue: BasePriorityQueue, business_fn, desired_types, group: Optional[str] = None, pool: Optional['SharedMemoryPool'] = None, worker_name: Optional[str] = None, processing_delay: float = 0.0, partition: Optional[str] = None, result_partition: Optional[str] = None, result_msg_type: str = 'result', on_task_start: Optional[callable] = None, on_task_done: Optional[callable] = None, on_produce: Optional[callable] = None, stop_event: Optional[multiprocessing.Event] = None):
+def run_worker_loop(queue: BasePriorityQueue, business_fn, desired_types, group: Optional[str] = None, pool: Optional['SharedMemoryPool'] = None, worker_name: Optional[str] = None, processing_delay: float = 0.0, partition: Optional[str] = None, result_partition: Optional[str] = None, result_msg_type: str = 'result', on_task_start: Optional[callable] = None, on_task_done: Optional[callable] = None, on_produce: Optional[callable] = None, stop_event: Optional[Any] = None, enable_metrics: bool = True, metrics_sample_rate: float = 1.0, metrics_sample_every: int = 1, msg_filter: Optional[callable] = None):
     """
     Standard execution loop for a pipeline node worker.
     
@@ -1323,18 +1334,42 @@ def run_worker_loop(queue: BasePriorityQueue, business_fn, desired_types, group:
         on_task_done: Callback when a task is finished.
         on_produce: Callback when an item is produced (sent to next stage).
         stop_event: Event to signal graceful shutdown.
+        msg_filter: Optional filter for message acquisition.
     """
     if pool is None:
         pool = get_default_pool()
 
     name = worker_name or f"worker-{os.getpid()}"
+    loop_iter = 0
     logger.info(f"{name} started")
     try:
         while not (stop_event and stop_event.is_set()):
+            loop_iter += 1
+            sample_hit = enable_metrics and (
+                (metrics_sample_rate >= 1.0 or random.random() < metrics_sample_rate) and
+                (metrics_sample_every <= 1 or (loop_iter % metrics_sample_every) == 0)
+            )
+
+            ts0 = time.perf_counter_ns() if sample_hit else None
             try:
-                msg = acquire_for_group(queue, desired_types, group=group, timeout=1.0, partition=partition)
+                msg = acquire_for_group(queue, desired_types, group=group, timeout=1.0, partition=partition, msg_filter=msg_filter)
             except Empty:
                 continue
+
+            metrics = None
+            if sample_hit:
+                # Choose where to store timing metadata so on_task_done can consume it.
+                if isinstance(msg.payload, dict):
+                    metrics = msg.payload
+                else:
+                    if msg.meta is None:
+                        msg.meta = {}
+                    metrics = msg.meta
+                ts1 = time.perf_counter_ns()
+                metrics.setdefault('_start_time', time.time())
+                metrics['_t_get'] = (ts1 - ts0) / 1e9
+                metrics.setdefault('_t_put', 0.0)
+                metrics.setdefault('_t_fn', 0.0)
 
             if msg.msg_type == 'shutdown':
                 logger.info(f"{name} shutting down")
@@ -1357,11 +1392,19 @@ def run_worker_loop(queue: BasePriorityQueue, business_fn, desired_types, group:
                 arr = load_array_from_payload(unpacked_payload, copy=False, pool=pool)
 
                 # call business logic
+                ts2 = time.perf_counter_ns() if sample_hit else None
                 try:
                     result = business_fn(arr, unpacked_payload, msg)
                 except Exception:
                     logger.exception(f"{name} business_fn error")
                     result = None
+                finally:
+                    if sample_hit:
+                        ts3 = time.perf_counter_ns()
+                        metrics['_t_fn'] = (ts3 - ts2) / 1e9
+                        ts_fn_end = ts3
+                    else:
+                        ts_fn_end = None
 
                 if processing_delay:
                     time.sleep(processing_delay)
@@ -1370,14 +1413,28 @@ def run_worker_loop(queue: BasePriorityQueue, business_fn, desired_types, group:
                     # Handle generators for one-to-many mapping
                     if hasattr(result, "__next__") and hasattr(result, "__iter__"):
                         try:
+                            item_count = 0
                             for item in result:
-                                if item is None: continue
+                                if item is None:
+                                    continue
                                 packed_payload = pack_payload(item, pool)
                                 res_msg = Message(payload=packed_payload, priority=50, msg_type=result_msg_type)
                                 _put(queue, res_msg, partition=result_partition)
+                                if sample_hit and item_count == 0:
+                                    ts4 = time.perf_counter_ns()
+                                    metrics['_t_put'] = (ts4 - (ts_fn_end or ts1)) / 1e9
+                                    metrics['_total_t'] = metrics.get('_t_get', 0.0) + metrics.get('_t_fn', 0.0) + metrics.get('_t_put', 0.0)
                                 if on_produce:
                                     try:
                                         on_produce(item)
+                                    except Exception:
+                                        pass
+                                item_count += 1
+                                if item_count > 0:
+                                    msg.payload['_generator_item_count'] = item_count
+                                if on_task_done:
+                                    try:
+                                        on_task_done(msg)
                                     except Exception:
                                         pass
                         except Exception:
@@ -1388,6 +1445,10 @@ def run_worker_loop(queue: BasePriorityQueue, business_fn, desired_types, group:
                         res_msg = Message(payload=packed_payload, priority=50, msg_type=result_msg_type)
                         try:
                             _put(queue, res_msg, partition=result_partition)
+                            if sample_hit:
+                                ts4 = time.perf_counter_ns()
+                                metrics['_t_put'] = (ts4 - (ts_fn_end or ts1)) / 1e9
+                                metrics['_total_t'] = metrics.get('_t_get', 0.0) + metrics.get('_t_fn', 0.0) + metrics.get('_t_put', 0.0)
                             if on_produce:
                                 try:
                                     on_produce(result)
@@ -1397,6 +1458,15 @@ def run_worker_loop(queue: BasePriorityQueue, business_fn, desired_types, group:
                             # on failure, attempt fallback: send original result inline
                             res_msg = Message(payload=result, priority=50, msg_type=result_msg_type)
                             _put(queue, res_msg, partition=result_partition)
+                            if sample_hit:
+                                ts4 = time.perf_counter_ns()
+                                metrics['_t_put'] = (ts4 - (ts_fn_end or ts1)) / 1e9
+                                metrics['_total_t'] = metrics.get('_t_get', 0.0) + metrics.get('_t_fn', 0.0) + metrics.get('_t_put', 0.0)
+                else:
+                    # No output produced; still record totals for visibility
+                    if sample_hit:
+                        metrics['_t_put'] = metrics.get('_t_put', 0.0)
+                        metrics['_total_t'] = metrics.get('_t_get', 0.0) + metrics.get('_t_fn', 0.0) + metrics.get('_t_put', 0.0)
             finally:
                 # free input buffer even if business_fn or packing fails
                 free_payload(msg.payload, pool=pool)

@@ -12,7 +12,7 @@ logger = logging.getLogger("ModernDemo")
 
 # --- Node Definitions ---
 
-@node(workers=16, input="crop_queue", output="infer_queue")
+@node(workers=2, input="crop_queue", output="infer_queue")
 def crop_node(data, payload):
     """
     模拟切图节点：读取大图并切块。
@@ -26,17 +26,20 @@ def crop_node(data, payload):
     slide = Image.fromarray(arr)
     
     coord = payload.get('coord')
-    x, y, w, h = coord
-    crop = slide.crop((x, y, x + w, y + h))
-    crop_arr = np.asarray(crop)
-    
-    return {
-        'slide_id': payload.get('slide_id'),
-        'coord': coord,
-        'data': crop_arr  # 自动进入 SHM
-    }
 
-@node(workers=4, input="infer_queue", output="results")
+    for x,y,w,h in [coord] * 20:  # 模拟每个任务切 10 个块
+        x, y, w, h = coord
+        crop = slide.crop((x, y, x + w, y + h))
+        crop_arr = np.asarray(crop)
+        time.sleep(0.05)  # 模拟切图耗时
+    
+        yield {
+            'slide_id': payload.get('slide_id'),
+            'coord': coord,
+            'data': crop_arr  # 自动进入 SHM
+        }
+
+@node(workers=2, input="infer_queue", output="results")
 def infer_node(data, payload):
     """
     模拟推理节点：接收切块数据并进行“模型推理”。
@@ -84,7 +87,7 @@ if __name__ == "__main__":
         logger.info("Producer thread started.")
         
         # 模拟标准业务流
-        num_slides = 100
+        num_slides = 20
         tile_size = 512
         for sidx in range(num_slides):
             if p._stop_event.is_set():
@@ -100,8 +103,9 @@ if __name__ == "__main__":
                     )
                 if p._stop_event.is_set():
                     break
-            time.sleep(1.0) # 模拟每秒处理一个 slide
+            # time.sleep(1.0) # 模拟每秒处理一个 slide
         logger.info("Producer thread exiting.")
+        p.put(None, partition="crop_queue", msg_type='shutdown')  # 发送结束信号
         
         logger.info("All test tasks dispatched.")
 
