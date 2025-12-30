@@ -294,57 +294,65 @@ class Pipeline:
         last_time = time.time()
         
         while not self._stop_event.is_set():
-            time.sleep(1.0)
-            now = time.time()
-            dt = now - last_time
-            if dt <= 0: continue
-            
-            # Update pipeline rates
-            p_metrics = self.metrics["pipeline"]
-            in_count = p_metrics["input_count"]
-            out_count = p_metrics["output_count"]
-            
-            last_in = self._last_metrics_snapshot.get("in", 0)
-            last_out = self._last_metrics_snapshot.get("out", 0)
-            
-            p_metrics["input_rate"] = round((in_count - last_in) / dt, 2)
-            p_metrics["output_rate"] = round((out_count - last_out) / dt, 2)
-            
-            self._last_metrics_snapshot["in"] = in_count
-            self._last_metrics_snapshot["out"] = out_count
-            self.metrics["pipeline"] = p_metrics # Trigger sync
-            
-            # Update node rates
-            n_metrics = self.metrics["nodes"]
-            for node_name, stats in n_metrics.items():
-                curr_total = stats["success"] + stats["fail"]
-                last_total = self._last_metrics_snapshot.get(f"node_{node_name}", 0)
-                stats["rate"] = round((curr_total - last_total) / dt, 2)
-                self._last_metrics_snapshot[f"node_{node_name}"] = curr_total
-
-                curr_produced = stats.get("produced", 0)
-                last_produced = self._last_metrics_snapshot.get(f"node_{node_name}_prod", 0)
-                stats["produced_rate"] = round((curr_produced - last_produced) / dt, 2)
-                self._last_metrics_snapshot[f"node_{node_name}_prod"] = curr_produced
+            try:
+                time.sleep(1.0)
+                now = time.time()
+                dt = now - last_time
+                if dt <= 0:
+                    continue
                 
-                n_metrics[node_name] = stats # Trigger sync
-            
-            self.metrics["nodes"] = n_metrics
+                # Update pipeline rates
+                p_metrics = self.metrics.get("pipeline") if hasattr(self.metrics, "get") else None
+                if p_metrics is None:
+                    break
+                in_count = p_metrics.get("input_count", 0)
+                out_count = p_metrics.get("output_count", 0)
+                
+                last_in = self._last_metrics_snapshot.get("in", 0)
+                last_out = self._last_metrics_snapshot.get("out", 0)
+                
+                p_metrics["input_rate"] = round((in_count - last_in) / dt, 2)
+                p_metrics["output_rate"] = round((out_count - last_out) / dt, 2)
+                
+                self._last_metrics_snapshot["in"] = in_count
+                self._last_metrics_snapshot["out"] = out_count
+                self.metrics["pipeline"] = p_metrics # Trigger sync
+                
+                # Update node rates
+                n_metrics = self.metrics.get("nodes") if hasattr(self.metrics, "get") else None
+                if n_metrics is None:
+                    break
+                for node_name, stats in n_metrics.items():
+                    curr_total = stats.get("success", 0) + stats.get("fail", 0)
+                    last_total = self._last_metrics_snapshot.get(f"node_{node_name}", 0)
+                    stats["rate"] = round((curr_total - last_total) / dt, 2)
+                    self._last_metrics_snapshot[f"node_{node_name}"] = curr_total
 
-            # Update Pool status
-            if self._pool:
-                pool_status = self._pool.get_status()
-                self.metrics["pool"] = {
-                    "used": pool_status["used"],
-                    "total": pool_status["total"]
-                }
+                    curr_produced = stats.get("produced", 0)
+                    last_produced = self._last_metrics_snapshot.get(f"node_{node_name}_prod", 0)
+                    stats["produced_rate"] = round((curr_produced - last_produced) / dt, 2)
+                    self._last_metrics_snapshot[f"node_{node_name}_prod"] = curr_produced
+                    
+                    n_metrics[node_name] = stats # Trigger sync
+                
+                self.metrics["nodes"] = n_metrics
 
-            # Update Partition status
-            if self._queue:
-                q_status = self._queue.get_status()
-                self.metrics["partitions"] = q_status
+                # Update Pool status
+                if self._pool:
+                    pool_status = self._pool.get_status()
+                    self.metrics["pool"] = pool_status
 
-            last_time = now
+                # Update Partition status
+                if self._queue:
+                    q_status = self._queue.get_status()
+                    self.metrics["partitions"] = q_status
+
+                last_time = now
+            except Exception:
+                if self._stop_event.is_set():
+                    break
+                logger.debug("Rate calculator loop terminating after exception", exc_info=True)
+                break
 
     def wait_for_completion(self, timeout: Optional[float] = None, check_interval: float = 1.0):
         """Wait until all queues are empty and no workers are processing."""
@@ -457,6 +465,9 @@ class Pipeline:
         if shm_registry is not None:
             set_shm_registry(shm_registry)
         set_shm_master(False) # Workers are never SHM masters
+
+        # Defensive: if metrics proxy was corrupted or replaced, disable metrics updates
+        metrics_proxy = metrics if hasattr(metrics, "get") else None
             
         pid = os.getpid()
         # print(f"DEBUG: Worker {node.name} (pid {pid}) starting loop...", flush=True)
@@ -477,13 +488,15 @@ class Pipeline:
             
         def on_produce(item):
             try:
-                n_metrics = metrics.get("nodes")
+                if metrics_proxy is None:
+                    return
+                n_metrics = metrics_proxy.get("nodes")
                 if n_metrics is not None:
                     stats = n_metrics.get(node.name)
                     if stats is not None:
                         stats["produced"] += 1
                         n_metrics[node.name] = stats
-                        metrics["nodes"] = n_metrics
+                        metrics_proxy["nodes"] = n_metrics
             except Exception:
                 pass
 
@@ -495,7 +508,9 @@ class Pipeline:
             
             # Update metrics
             try:
-                n_metrics = metrics.get("nodes")
+                if metrics_proxy is None:
+                    return
+                n_metrics = metrics_proxy.get("nodes")
                 if n_metrics is not None:
                     stats = n_metrics.get(node.name)
                     if stats is not None:
@@ -510,13 +525,14 @@ class Pipeline:
                         stats["latency"] = round(curr_lat * 0.9 + duration * 0.1, 4)
                         
                         n_metrics[node.name] = stats # Update the Manager.dict
-                        metrics["nodes"] = n_metrics # Ensure top-level sync
+                        metrics_proxy["nodes"] = n_metrics # Ensure top-level sync
 
                         # If this node is a sink (no output partition), count as pipeline output
                         if not node.output_partition:
-                            p_metrics = metrics["pipeline"]
-                            p_metrics["output_count"] += 1
-                            metrics["pipeline"] = p_metrics
+                            p_metrics = metrics_proxy.get("pipeline")
+                            if p_metrics is not None:
+                                p_metrics["output_count"] += 1
+                                metrics_proxy["pipeline"] = p_metrics
             except Exception as e:
                 logger.error(f"Metrics update error in worker: {e}")
 
@@ -561,14 +577,14 @@ class Pipeline:
             if node.output_partition and node.output_partition not in parts:
                 parts[node.output_partition] = 1024 # Default large capacity for results/meta
 
-        self._queue = PartitionedPriorityQueue(manager=self._manager, partitions=parts)
+        self._queue = PartitionedPriorityQueue(manager=self._manager, partitions=parts, stop_event=self._stop_event)
         
         # Initialize shared SHM registry
         self._shm_registry = self._manager.list()
         set_shm_registry(self._shm_registry)
         set_shm_master(True)
         
-        self._pool = SharedMemoryPool.create(self._manager, pool_size=self._pool_size, block_size=self._block_size)
+        self._pool = SharedMemoryPool.create(self._manager, pool_size=self._pool_size, block_size=self._block_size, stop_event=self._stop_event)
         set_default_pool(self._pool)
         return self
 

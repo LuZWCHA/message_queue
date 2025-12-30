@@ -21,6 +21,7 @@ import logging
 import atexit
 import signal
 import os
+import contextlib
 from dataclasses import dataclass, asdict
 from typing import Any, Optional, Tuple, List, Set, Iterable, Union, Dict, Callable
 import numpy as np
@@ -40,10 +41,29 @@ logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(message)s')
 _SHM_POOLS: Set[SharedMemoryPool] = set()
 _EPHEMERAL_SHM: Set[str] = set()
 _ALL_CREATED_SHM: Set[str] = set() # Track all SHM created by this process
+_SHM_CACHE: Dict[str, shared_memory.SharedMemory] = {} # Cache for pool attachments
 _SHM_LOCK = threading.RLock()
 _DEFAULT_POOL: Optional[SharedMemoryPool] = None
 _SHARED_SHM_REGISTRY: Optional[List[str]] = None
 _I_AM_SHM_MASTER: bool = False
+
+
+def _get_shm_attachment(name: str) -> shared_memory.SharedMemory:
+    """Get or create a cached attachment to a shared memory segment."""
+    with _SHM_LOCK:
+        if name in _SHM_CACHE:
+            return _SHM_CACHE[name]
+        
+        shm = shared_memory.SharedMemory(name=name)
+        # Unregister immediately to avoid resource_tracker issues
+        try:
+            from multiprocessing import resource_tracker
+            name_to_unreg = getattr(shm, '_name', shm.name)
+            resource_tracker.unregister(name_to_unreg, 'shared_memory')
+        except Exception:
+            pass
+        _SHM_CACHE[name] = shm
+        return shm
 
 
 def set_default_pool(pool: SharedMemoryPool):
@@ -95,7 +115,15 @@ def _cleanup_shm():
             _ALL_CREATED_SHM.clear()
             _EPHEMERAL_SHM.clear()
 
-            # 3. Cleanup from shared registry if available (Manager-dependent)
+            # 3. Close cached attachments
+            for name, shm in list(_SHM_CACHE.items()):
+                try:
+                    shm.close()
+                except Exception:
+                    pass
+            _SHM_CACHE.clear()
+
+            # 4. Cleanup from shared registry if available (Manager-dependent)
             # ONLY the master process should do this to avoid redundant work and hangs in workers
             if _I_AM_SHM_MASTER and _SHARED_SHM_REGISTRY is not None:
                 try:
@@ -121,6 +149,11 @@ class Empty(Exception):
 
 
 class Full(Exception):
+    pass
+
+
+class SharedMemoryOOMError(Exception):
+    """Raised when SharedMemoryPool cannot allocate enough space."""
     pass
 
 
@@ -427,7 +460,7 @@ class PartitionedPriorityQueue(BasePriorityQueue):
         default_capacity: Default capacity for new partitions.
     """
 
-    def __init__(self, manager: Optional[Any] = None, partitions: Optional[dict] = None, default_capacity: int = 1024):
+    def __init__(self, manager: Optional[Any] = None, partitions: Optional[dict] = None, default_capacity: int = 1024, stop_event: Optional[multiprocessing.Event] = None):
         self._own_manager = False
         if manager is None:
             self._manager = multiprocessing.Manager()
@@ -435,6 +468,7 @@ class PartitionedPriorityQueue(BasePriorityQueue):
         else:
             self._manager = manager
 
+        self._stop_event = stop_event
         # partitions: mapping partition_name -> capacity
         self._queues = {}
         self._capacities = {}
@@ -488,6 +522,9 @@ class PartitionedPriorityQueue(BasePriorityQueue):
         q = self._queues[partition]
         start = time.time()
         while True:
+            if self._stop_event and self._stop_event.is_set():
+                raise Full("Pipeline stopping")
+
             with self._lock:
                 cap = self._capacities.get(partition, self._default_capacity)
                 if q.size() < cap:
@@ -498,16 +535,16 @@ class PartitionedPriorityQueue(BasePriorityQueue):
                 if not block:
                     raise Full(f"partition '{partition}' is full")
                 
-                remaining = None
+                # Calculate wait time: use a small interval to check stop_event
+                wait_timeout = 0.5
                 if timeout is not None:
                     remaining = timeout - (time.time() - start)
                     if remaining <= 0:
                         raise Full(f"timeout while waiting to put into partition '{partition}'")
+                    wait_timeout = min(wait_timeout, remaining)
                 
                 try:
-                    if not self._cond.wait(timeout=remaining):
-                        if timeout is not None:
-                            raise Full(f"timeout while waiting to put into partition '{partition}'")
+                    self._cond.wait(timeout=wait_timeout)
                 except (EOFError, BrokenPipeError, Exception):
                     # Manager might be shutting down
                     raise Full("Queue manager is unavailable (shutting down)")
@@ -516,6 +553,9 @@ class PartitionedPriorityQueue(BasePriorityQueue):
         start = time.time()
         
         while True:
+            if self._stop_event and self._stop_event.is_set():
+                raise Empty("Pipeline stopping")
+
             try:
                 with self._lock:
                     # If partition is specified, try only that one
@@ -544,13 +584,16 @@ class PartitionedPriorityQueue(BasePriorityQueue):
                     if not block:
                         raise Empty()
 
-                    remaining = None
+                    # Calculate wait time: use a small interval to check stop_event
+                    wait_timeout = 0.5
                     if timeout is not None:
                         remaining = timeout - (time.time() - start)
                         if remaining <= 0:
                             raise Empty()
+                        wait_timeout = min(wait_timeout, remaining)
                     
-                    if not self._cond.wait(timeout=remaining):
+                    self._cond.wait(timeout=wait_timeout)
+                    if timeout is not None and (time.time() - start) >= timeout:
                         raise Empty()
             except (EOFError, BrokenPipeError, Exception) as e:
                 if isinstance(e, Empty): raise
@@ -668,7 +711,8 @@ class SharedMemoryStore:
 
     @staticmethod
     def load_array(meta: dict, copy: bool = True) -> np.ndarray:
-        shm = shared_memory.SharedMemory(name=meta['name'])
+        shm_name = meta.get('shm_name') or meta.get('name')
+        shm = shared_memory.SharedMemory(name=shm_name)
         
         # Unregister from resource_tracker to avoid warnings in workers
         try:
@@ -678,7 +722,15 @@ class SharedMemoryStore:
         except Exception:
             pass
 
-        arr = np.ndarray(meta['shape'], dtype=np.dtype(meta['dtype']), buffer=shm.buf)
+        offset = meta.get('offset', 0)
+        nbytes = meta.get('nbytes')
+        
+        if nbytes is None:
+            # Fallback for old meta or ephemeral without nbytes
+            arr = np.ndarray(meta['shape'], dtype=np.dtype(meta['dtype']), buffer=shm.buf)
+        else:
+            arr = np.ndarray(meta['shape'], dtype=np.dtype(meta['dtype']), buffer=shm.buf[offset:offset+nbytes])
+            
         if copy:
             out = arr.copy()
             shm.close()
@@ -707,170 +759,247 @@ class SharedMemoryStore:
 
 class SharedMemoryPool:
     """
-    A reference-counted pool for managing Shared Memory blocks.
+    A reference-counted pool for managing Shared Memory blocks with fragmented allocation.
     
-    This pool pre-allocates fixed-size blocks to reduce the overhead of 
-    creating/destroying shared memory segments. It also supports reference 
-    counting, allowing multiple messages to point to the same data block.
+    This pool pre-allocates a large shared memory segment and manages it in fragments.
+    It supports reference counting, allowing multiple messages to point to the same data block.
     
-    When a block's reference count reaches zero, it is returned to the free list.
-    If an array is larger than the block size, it falls back to ephemeral 
-    allocation (one-time use).
+    When a block's reference count reaches zero, it is returned to the free list and merged.
+    If an array is larger than the total pool size, it falls back to ephemeral allocation.
     """
 
-    def __init__(self, free_list, alloc_list, ref_counts, lock, block_size: int, prefix: str = 'shmpool'):
-        self._free = free_list
-        self._alloc = alloc_list
+    def __init__(self, free_ranges, allocations, ref_counts, lock, condition, total_size: int, prefix: str = 'shmpool', stop_event: Optional[multiprocessing.Event] = None):
+        self._free_ranges = free_ranges # manager.list of (shm_name, offset, size)
+        self._allocations = allocations # manager.dict of alloc_id -> (shm_name, offset, size)
         self._ref_counts = ref_counts
         self._lock = lock
-        self.block_size = int(block_size)
+        self._condition = condition
+        self._stop_event = stop_event
+        self.total_size = total_size
         self.prefix = prefix
+        self._shm_names = set() # Track all segments used by this pool
 
     @classmethod
-    def create(cls, manager: Any, pool_size: int = 8, block_size: int = 1024 * 1024, prefix: str = 'shmpool') -> 'SharedMemoryPool':
-        free_list = manager.list()
-        alloc_list = manager.list()
-        ref_counts = manager.dict()
-        lock = manager.Lock()
-        pool = cls(free_list, alloc_list, ref_counts, lock, block_size, prefix=prefix)
-        # preallocate
-        for _ in range(pool_size):
-            shm = shared_memory.SharedMemory(create=True, size=block_size)
-            name = shm.name
-            # In Python 3.8+, we need to unregister from resource_tracker 
-            # if we want to manage the lifecycle ourselves across processes.
-            try:
-                from multiprocessing import resource_tracker
-                name_to_unreg = getattr(shm, '_name', shm.name)
-                resource_tracker.unregister(name_to_unreg, 'shared_memory')
-            except Exception:
-                pass
-            shm.close()
-            alloc_list.append(name)
-            free_list.append(name)
-            with _SHM_LOCK:
-                _ALL_CREATED_SHM.add(name)
-            if _SHARED_SHM_REGISTRY is not None:
-                try:
-                    _SHARED_SHM_REGISTRY.append(name)
-                except Exception:
-                    pass
-        # register for cleanup
-        with _SHM_LOCK:
-            _SHM_POOLS.add(pool)
-        return pool
-
-    def store_array(self, arr: np.ndarray) -> dict:
-        arr = np.ascontiguousarray(arr)
-        nbytes = arr.nbytes
-        if nbytes > self.block_size:
-            # fallback to ephemeral allocation
-            meta = SharedMemoryStore.store_array(arr)
-            meta['pool'] = False
-            # Ephemeral segments are tracked by SharedMemoryStore; skip pool lock to avoid noisy warnings
-            return meta
-
-        name = None
-        if self._lock.acquire(timeout=2.0):
-            try:
-                if len(self._free) > 0:
-                    name = self._free.pop(0)
-                else:
-                    # allocate a new block and track it
-                    shm = shared_memory.SharedMemory(create=True, size=self.block_size)
-                    name = shm.name
-                    try:
-                        from multiprocessing.resource_tracker import unregister
-                        unregister(shm._name, 'shared_memory')
-                    except (ImportError, AttributeError):
-                        pass
-                    shm.close()
-                    self._alloc.append(name)
-                    with _SHM_LOCK:
-                        _ALL_CREATED_SHM.add(name)
-                    if _SHARED_SHM_REGISTRY is not None:
-                        try:
-                            _SHARED_SHM_REGISTRY.append(name)
-                        except Exception:
-                            pass
-                self._ref_counts[name] = 1
-            finally:
-                self._lock.release()
-        else:
-            logger.error("Failed to acquire pool lock for store_array")
-            return SharedMemoryStore.store_array(arr) # Fallback to ephemeral
-
-        # write into block
-        shm = shared_memory.SharedMemory(name=name)
-        # Unregister here too
+    def create(cls, manager: Any, pool_size: int = 8, block_size: int = 1024 * 1024, prefix: str = 'shmpool', stop_event: Optional[multiprocessing.Event] = None) -> 'SharedMemoryPool':
+        total_size = pool_size * block_size
+        shm = shared_memory.SharedMemory(create=True, size=total_size)
+        shm_name = shm.name
+        
+        # In Python 3.8+, we need to unregister from resource_tracker 
         try:
             from multiprocessing import resource_tracker
             name_to_unreg = getattr(shm, '_name', shm.name)
             resource_tracker.unregister(name_to_unreg, 'shared_memory')
         except Exception:
             pass
-        shm.buf[:nbytes] = arr.tobytes()
         shm.close()
-        meta = {'name': name, 'shape': arr.shape, 'dtype': str(arr.dtype), 'nbytes': nbytes, 'pool': True, 'block_size': self.block_size}
+
+        free_ranges = manager.list([(shm_name, 0, total_size)])
+        allocations = manager.dict()
+        ref_counts = manager.dict()
+        lock = manager.Lock()
+        condition = manager.Condition(lock)
+        
+        pool = cls(free_ranges, allocations, ref_counts, lock, condition, total_size, prefix=prefix, stop_event=stop_event)
+        pool._shm_names.add(shm_name)
+        
+        # register for cleanup
+        with _SHM_LOCK:
+            _ALL_CREATED_SHM.add(shm_name)
+            _SHM_POOLS.add(pool)
+            
+        if _SHARED_SHM_REGISTRY is not None:
+            try:
+                _SHARED_SHM_REGISTRY.append(shm_name)
+            except Exception:
+                pass
+        return pool
+
+    def store_array(self, arr: np.ndarray, timeout: Optional[float] = None) -> dict:
+        arr = np.ascontiguousarray(arr)
+        nbytes = arr.nbytes
+        
+        if nbytes > self.total_size:
+            raise SharedMemoryOOMError(
+                f"Requested {nbytes} bytes, but total pool size is only {self.total_size} bytes. "
+                "This allocation can never succeed in the current pool."
+            )
+
+        start_time = time.time()
+        alloc_info = None # (shm_name, offset, nbytes, alloc_id)
+        
+        with self._condition:
+            while True:
+                if self._stop_event and self._stop_event.is_set():
+                    raise SharedMemoryOOMError("Pipeline stopping")
+
+                # Find first-fit
+                best_idx = -1
+                for i, (shm_name, offset, size) in enumerate(self._free_ranges):
+                    if size >= nbytes:
+                        best_idx = i
+                        break
+                
+                if best_idx != -1:
+                    shm_name, offset, size = self._free_ranges.pop(best_idx)
+                    if size > nbytes:
+                        # Put the remainder back
+                        self._free_ranges.append((shm_name, offset + nbytes, size - nbytes))
+                    
+                    alloc_id = f"pool_{shm_name}_{offset}_{uuid.uuid4().hex[:8]}"
+                    self._allocations[alloc_id] = (shm_name, offset, nbytes)
+                    self._ref_counts[alloc_id] = 1
+                    alloc_info = (shm_name, offset, nbytes, alloc_id)
+                    break
+                
+                # No space, wait
+                wait_timeout = 0.5
+                if timeout is not None:
+                    remaining = timeout - (time.time() - start_time)
+                    if remaining <= 0:
+                        raise SharedMemoryOOMError(
+                            f"Timed out after {timeout}s waiting for {nbytes} bytes in SharedMemoryPool. "
+                            "Pool is likely fragmented or leaked."
+                        )
+                    wait_timeout = min(wait_timeout, remaining)
+                
+                self._condition.wait(timeout=wait_timeout)
+                if timeout is not None and (time.time() - start_time) >= timeout:
+                    raise SharedMemoryOOMError(f"Timed out waiting for {nbytes} bytes in SharedMemoryPool.")
+
+        shm_name, offset, nbytes, alloc_id = alloc_info
+        # write into block using cached attachment
+        shm = _get_shm_attachment(shm_name)
+        shm.buf[offset:offset+nbytes] = arr.tobytes()
+        
+        meta = {
+            'name': alloc_id, 
+            'shm_name': shm_name,
+            'offset': offset,
+            'nbytes': nbytes,
+            'shape': arr.shape, 
+            'dtype': str(arr.dtype), 
+            'pool': True
+        }
         return meta
+
+    def load_array(self, meta: dict, copy: bool = True) -> np.ndarray:
+        """Load an array from the pool using metadata."""
+        if not meta.get('pool'):
+            return SharedMemoryStore.load_array(meta, copy=copy)
+            
+        shm_name = meta.get('shm_name') or meta.get('name')
+        offset = meta.get('offset', 0)
+        nbytes = meta.get('nbytes')
+        
+        shm = _get_shm_attachment(shm_name)
+            
+        arr = np.ndarray(meta['shape'], dtype=np.dtype(meta['dtype']), 
+                         buffer=shm.buf[offset:offset+nbytes])
+        if copy:
+            return arr.copy()
+        else:
+            return arr
+
+    @contextlib.contextmanager
+    def acquire_array(self, meta: dict, copy: bool = False):
+        """
+        Context manager to load an array and automatically free it when done.
+        
+        This implements the 'manage memory release and return' pattern.
+        """
+        arr = self.load_array(meta, copy=copy)
+        try:
+            yield arr
+        finally:
+            self.free(meta)
 
     def inc_ref(self, name: str, delta: int = 1) -> None:
         """Increment reference count for a block."""
-        if self._lock.acquire(timeout=1.0):
-            try:
-                if name in self._ref_counts:
-                    self._ref_counts[name] += delta
-                else:
-                    self._ref_counts[name] = 1 + delta
-            finally:
-                self._lock.release()
+        with self._condition:
+            if name in self._ref_counts:
+                self._ref_counts[name] += delta
+            else:
+                # If it's not in ref_counts, it might be ephemeral or already freed
+                pass
 
-    def free(self, name: str) -> None:
-        # Decrement ref count; only actually free if it hits 0
-        if self._lock.acquire(timeout=2.0):
-            try:
-                count = self._ref_counts.get(name, 1) - 1
-                if count > 0:
-                    self._ref_counts[name] = count
-                    return
-                # count <= 0, cleanup
-                if name in self._ref_counts:
-                    del self._ref_counts[name]
+    def free(self, meta_or_id: Union[str, dict]) -> None:
+        """Decrement reference count; only actually free if it hits 0."""
+        if isinstance(meta_or_id, dict):
+            alloc_id = meta_or_id.get('name')
+        else:
+            alloc_id = meta_or_id
+            
+        if not alloc_id:
+            return
 
-                if name in self._alloc:
-                    # return to free list
-                    if name not in self._free:
-                        self._free.append(name)
-                    return
-            finally:
-                self._lock.release()
+        with self._condition:
+            if alloc_id not in self._ref_counts:
+                # If lock failed or not in pool, try ephemeral unlink if it's a dict
+                if isinstance(meta_or_id, dict) and not meta_or_id.get('pool'):
+                    SharedMemoryStore.unlink(meta_or_id['name'])
+                return
+                
+            count = self._ref_counts[alloc_id] - 1
+            if count > 0:
+                self._ref_counts[alloc_id] = count
+                return
+                
+            # count <= 0, cleanup
+            if alloc_id in self._ref_counts:
+                del self._ref_counts[alloc_id]
+
+            if alloc_id in self._allocations:
+                shm_name, offset, nbytes = self._allocations.pop(alloc_id)
+                self._free_ranges.append((shm_name, offset, nbytes))
+                self._merge_ranges()
+                self._condition.notify_all()
+
+    def _merge_ranges(self):
+        """Merge adjacent free ranges to reduce fragmentation."""
+        if not self._free_ranges:
+            return
+        # Group by shm_name
+        by_shm = {}
+        for shm_name, offset, size in self._free_ranges:
+            by_shm.setdefault(shm_name, []).append((offset, size))
         
-        # If lock failed or not in pool, try ephemeral unlink
-        try:
-            SharedMemoryStore.unlink(name)
-        except Exception:
-            pass
+        new_ranges = []
+        for shm_name, ranges in by_shm.items():
+            ranges.sort()
+            if not ranges: continue
+            curr_off, curr_size = ranges[0]
+            for next_off, next_size in ranges[1:]:
+                if curr_off + curr_size == next_off:
+                    curr_size += next_size
+                else:
+                    new_ranges.append((shm_name, curr_off, curr_size))
+                    curr_off, curr_size = next_off, next_size
+            new_ranges.append((shm_name, curr_off, curr_size))
+        
+        # Update the manager list in-place
+        del self._free_ranges[:]
+        self._free_ranges.extend(new_ranges)
 
     def close(self) -> None:
-        # unlink all allocated blocks
-        # Use a short timeout for close to avoid hanging the whole system
-        if self._lock.acquire(timeout=1.0):
-            try:
-                for name in list(self._alloc):
-                    try:
-                        shm = shared_memory.SharedMemory(name=name)
-                        shm.unlink()
-                        shm.close()
-                    except Exception:
-                        pass
-                    with _SHM_LOCK:
-                        if name in _ALL_CREATED_SHM:
-                            _ALL_CREATED_SHM.remove(name)
-                self._alloc[:] = []
-                self._free[:] = []
-                self._ref_counts.clear()
-            finally:
-                self._lock.release()
+        """Unlink all allocated blocks and the pool itself."""
+        with self._condition:
+            for shm_name in list(self._shm_names):
+                try:
+                    shm = shared_memory.SharedMemory(name=shm_name)
+                    shm.unlink()
+                    shm.close()
+                except Exception:
+                    pass
+                with _SHM_LOCK:
+                    if shm_name in _ALL_CREATED_SHM:
+                        _ALL_CREATED_SHM.remove(shm_name)
+            
+            self._shm_names.clear()
+            del self._free_ranges[:]
+            self._allocations.clear()
+            self._ref_counts.clear()
+            self._condition.notify_all()
         
         with _SHM_LOCK:
             if self in _SHM_POOLS:
@@ -878,11 +1007,13 @@ class SharedMemoryPool:
 
     def get_status(self) -> dict:
         """Return pool usage statistics."""
-        with self._lock:
+        with self._condition:
+            total_free = sum(size for _, _, size in self._free_ranges)
             return {
-                'total': len(self._alloc),
-                'free': len(self._free),
-                'used': len(self._alloc) - len(self._free),
+                'total_size': self.total_size,
+                'free_size': total_free,
+                'used_size': self.total_size - total_free,
+                'num_allocations': len(self._allocations),
                 'ref_counts': dict(self._ref_counts)
             }
 
@@ -947,12 +1078,15 @@ def acquire_for_group(queue: BasePriorityQueue, desired_types, group: Optional[s
     return _get(queue, block=True, timeout=timeout, msg_filter=combined_filter, partition=partition)
 
 
-def load_array_from_payload(payload: dict, copy: bool = True) -> Optional[np.ndarray]:
+def load_array_from_payload(payload: dict, copy: bool = True, pool: Optional['SharedMemoryPool'] = None) -> Optional[np.ndarray]:
     """Load an ndarray from a message payload by recursively searching for SHM metas.
 
     This helper is now fully symmetric with pack_payload: it scans the entire
     payload and returns the FIRST valid ndarray it finds (either direct or in SHM).
     """
+    if pool is None:
+        pool = get_default_pool()
+
     # Accept Message instances
     if isinstance(payload, Message):
         payload = payload.payload
@@ -970,6 +1104,8 @@ def load_array_from_payload(payload: dict, copy: bool = True) -> Optional[np.nda
         if isinstance(obj, dict):
             # Check if this dict is a SHM meta
             if obj.get('name') and (obj.get('shape') or obj.get('dtype') or 'pool' in obj):
+                if pool and obj.get('pool'):
+                    return pool.load_array(obj, copy=copy)
                 try:
                     return SharedMemoryStore.load_array(obj, copy=copy)
                 except Exception:
@@ -1048,6 +1184,7 @@ def pack_payload(obj: Any, pool: Optional['SharedMemoryPool'] = None) -> Any:
             if pool:
                 return pool.store_array(obj)
             else:
+                logger.warning("No SharedMemoryPool provided for pack_payload. Falling back to ephemeral allocation.")
                 return SharedMemoryStore.store_array(obj)
         
         if isinstance(obj, dict):
@@ -1068,6 +1205,8 @@ def pack_payload(obj: Any, pool: Optional['SharedMemoryPool'] = None) -> Any:
         if isinstance(obj, tuple):
             return tuple(pack_payload(v, pool) for v in obj)
         return obj
+    except SharedMemoryOOMError:
+        raise
     except Exception:
         return obj
 
@@ -1087,7 +1226,10 @@ def unpack_payload(payload: Any, pool: Optional['SharedMemoryPool'] = None, copy
         # Check if this dict is a SHM meta
         if payload.get('name') and (payload.get('shape') or payload.get('dtype') or 'pool' in payload):
             try:
-                return SharedMemoryStore.load_array(payload, copy=copy)
+                if pool is not None:
+                    return pool.load_array(payload, copy=copy)
+                else:
+                    return SharedMemoryStore.load_array(payload, copy=copy)
             except Exception:
                 return payload
         
@@ -1126,14 +1268,13 @@ def free_payload(payload: Any, pool: Optional['SharedMemoryPool'] = None) -> Non
     def _free_meta(meta):
         if not isinstance(meta, dict):
             return
-        name = meta.get('name') or meta.get('shm_name')
-        if not name:
-            return
         try:
-            if pool is not None and meta.get('pool'):
-                pool.free(name)
+            if pool is not None:
+                pool.free(meta)
             else:
-                SharedMemoryStore.unlink(name)
+                name = meta.get('name') or meta.get('shm_name')
+                if name:
+                    SharedMemoryStore.unlink(name)
         except Exception:
             pass
 
@@ -1213,7 +1354,7 @@ def run_worker_loop(queue: BasePriorityQueue, business_fn, desired_types, group:
             try:
                 # For backward compatibility, still try to find the "main" array if it exists.
                 # We use copy=False because unpacked_payload already contains copies.
-                arr = load_array_from_payload(unpacked_payload, copy=False)
+                arr = load_array_from_payload(unpacked_payload, copy=False, pool=pool)
 
                 # call business logic
                 try:

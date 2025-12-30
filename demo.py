@@ -12,7 +12,7 @@ logger = logging.getLogger("ModernDemo")
 
 # --- Node Definitions ---
 
-@node(workers=2, input="crop_queue", output="infer_queue")
+@node(workers=16, input="crop_queue", output="infer_queue")
 def crop_node(data, payload):
     """
     模拟切图节点：读取大图并切块。
@@ -75,7 +75,7 @@ if __name__ == "__main__":
 
     p = Pipeline.from_nodes(
         [crop_node, infer_node, sink_node],
-        pool_size=30, 
+        pool_size=2, 
         block_size=1024 * 1024  # 1MB blocks
     )
     

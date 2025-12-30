@@ -318,7 +318,7 @@ DASHBOARD_HTML = """
             <div class="card-title">Memory Pool</div>
             <div class="metric-group">
                 <div class="metric-value" id="pool-usage">0 / 0</div>
-                <div class="metric-sub">Shared Memory Blocks (Used / Total)</div>
+                <div class="metric-sub" id="pool-sub">Shared Memory Usage (Used / Total)</div>
             </div>
         </div>
         
@@ -619,6 +619,15 @@ DASHBOARD_HTML = """
             line.style.transform = `rotate(${angle}deg)`;
         }
 
+        function formatBytes(bytes, decimals = 2) {
+            if (bytes === 0) return '0 B';
+            const k = 1024;
+            const dm = decimals < 0 ? 0 : decimals;
+            const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
+            const i = Math.floor(Math.log(bytes) / Math.log(k));
+            return parseFloat((bytes / Math.pow(k, i)).toFixed(dm)) + ' ' + sizes[i];
+        }
+
         async function update() {
             try {
                 const resp = await fetch('/api/metrics');
@@ -629,7 +638,11 @@ DASHBOARD_HTML = """
                 statusEl.innerText = 'Live System';
 
                 if (data.pool) {
-                    document.getElementById('pool-usage').innerText = `${data.pool.used} / ${data.pool.total}`;
+                    const used = data.pool.used_size || 0;
+                    const total = data.pool.total_size || 0;
+                    const allocs = data.pool.num_allocations || 0;
+                    document.getElementById('pool-usage').innerText = `${formatBytes(used)} / ${formatBytes(total)}`;
+                    document.getElementById('pool-sub').innerText = `Shared Memory: ${allocs} active allocations`;
                 }
 
                 if (data.pipeline) {
