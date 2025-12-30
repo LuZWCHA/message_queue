@@ -470,7 +470,6 @@ class Pipeline:
         metrics_proxy = metrics if hasattr(metrics, "get") else None
             
         pid = os.getpid()
-        # print(f"DEBUG: Worker {node.name} (pid {pid}) starting loop...", flush=True)
         
         # Setup signal handlers for workers to ensure cleanup on SIGTERM
         def handle_sigterm(*args):
