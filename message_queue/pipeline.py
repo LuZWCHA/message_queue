@@ -509,7 +509,7 @@ class Pipeline:
             active_tasks[pid] = msg
             msg.payload['_start_time'] = time.time()
             
-        def on_produce(item):
+        def on_produce(item, msg=None, current_item_count=1):
             try:
                 if metrics_proxy is None:
                     return
@@ -518,8 +518,25 @@ class Pipeline:
                     stats = n_metrics.get(node.name)
                     if stats is not None:
                         stats["produced"] += 1
+                        
+                        # Update latency in real-time for generators
+                        if msg and isinstance(msg.payload, dict):
+                            start_time = msg.payload.get('_start_time')
+                            if start_time:
+                                duration = (time.time() - start_time) / max(current_item_count, 1)
+                                curr_lat = stats.get("latency", 0.0)
+                                stats["latency"] = round(curr_lat * 0.9 + duration * 0.1, 4)
+
                         n_metrics[node.name] = stats
                         metrics_proxy["nodes"] = n_metrics
+
+                        # If this node is a sink (no output partition), count as pipeline output
+                        # We do this in on_produce to make the pipeline output rate responsive
+                        if not node.output_partition:
+                            p_metrics = metrics_proxy.get("pipeline")
+                            if p_metrics is not None:
+                                p_metrics["output_count"] += 1
+                                metrics_proxy["pipeline"] = p_metrics
             except Exception:
                 pass
 
@@ -552,7 +569,7 @@ class Pipeline:
                         else:
                             stats["success"] += 1
                         
-                        # Moving average for latency
+                        # Final latency update for accuracy
                         curr_lat = stats.get("latency", 0.0)
                         stats["latency"] = round(curr_lat * 0.9 + duration * 0.1, 4)
 
@@ -568,13 +585,6 @@ class Pipeline:
                         
                         n_metrics[node.name] = stats # Update the Manager.dict
                         metrics_proxy["nodes"] = n_metrics # Ensure top-level sync
-
-                        # If this node is a sink (no output partition), count as pipeline output
-                        if not node.output_partition:
-                            p_metrics = metrics_proxy.get("pipeline")
-                            if p_metrics is not None:
-                                p_metrics["output_count"] += 1
-                                metrics_proxy["pipeline"] = p_metrics
             except Exception as e:
                 logger.error(f"Metrics update error in worker: {e}")
 

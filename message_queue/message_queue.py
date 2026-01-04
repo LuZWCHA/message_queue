@@ -1426,17 +1426,13 @@ def run_worker_loop(queue: BasePriorityQueue, business_fn, desired_types, group:
                                     metrics['_total_t'] = metrics.get('_t_get', 0.0) + metrics.get('_t_fn', 0.0) + metrics.get('_t_put', 0.0)
                                 if on_produce:
                                     try:
-                                        on_produce(item)
+                                        on_produce(item, msg, item_count)
                                     except Exception:
                                         pass
                                 item_count += 1
-                                if item_count > 0:
-                                    msg.payload['_generator_item_count'] = item_count
-                                if on_task_done:
-                                    try:
-                                        on_task_done(msg)
-                                    except Exception:
-                                        pass
+                            
+                            if item_count > 0:
+                                msg.payload['_generator_item_count'] = item_count
                         except Exception:
                             logger.exception(f"{name} generator error")
                     else:
@@ -1451,7 +1447,7 @@ def run_worker_loop(queue: BasePriorityQueue, business_fn, desired_types, group:
                                 metrics['_total_t'] = metrics.get('_t_get', 0.0) + metrics.get('_t_fn', 0.0) + metrics.get('_t_put', 0.0)
                             if on_produce:
                                 try:
-                                    on_produce(result)
+                                    on_produce(result, msg, 1)
                                 except Exception:
                                     pass
                         except Exception:
@@ -1462,6 +1458,11 @@ def run_worker_loop(queue: BasePriorityQueue, business_fn, desired_types, group:
                                 ts4 = time.perf_counter_ns()
                                 metrics['_t_put'] = (ts4 - (ts_fn_end or ts1)) / 1e9
                                 metrics['_total_t'] = metrics.get('_t_get', 0.0) + metrics.get('_t_fn', 0.0) + metrics.get('_t_put', 0.0)
+                            if on_produce:
+                                try:
+                                    on_produce(result, msg, 1)
+                                except Exception:
+                                    pass
                 else:
                     # No output produced; still record totals for visibility
                     if sample_hit:
